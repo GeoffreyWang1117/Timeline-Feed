@@ -18,6 +18,7 @@ router.get('/health', (req, res) => {
 
 // User routes
 router.post('/users/register', strictRateLimiter, userController.register);
+router.post('/users/login', strictRateLimiter, userController.login);
 router.post('/users/:userId/follow', authenticate, rateLimiter(), userController.followUser);
 router.delete('/users/:userId/follow', authenticate, rateLimiter(), userController.unfollowUser);
 router.get('/users/:userId/followers', optionalAuth, userController.getFollowers);

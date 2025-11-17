@@ -2,6 +2,7 @@ import { redis, REDIS_KEYS, CACHE_TTL } from '../config/database';
 import { logger } from '../utils/logger';
 import config from '../config';
 import { TimelinePost, HotContentMetrics } from '../types';
+import crypto from 'crypto';
 
 export class CacheService {
   /**
@@ -76,9 +77,9 @@ export class CacheService {
       let start = 0;
       let maxScore = '+inf';
 
-      // Parse cursor
+      // Parse cursor (with userId validation)
       if (cursor) {
-        const cursorData = this.decodeCursor(cursor);
+        const cursorData = this.decodeCursor(cursor, userId);
         maxScore = cursorData.timestamp.toString();
       }
 
@@ -95,16 +96,19 @@ export class CacheService {
       const hasMore = postIds.length > limit;
       const results = hasMore ? postIds.slice(0, limit) : postIds;
 
-      // Generate next cursor
+      // Generate next cursor (with userId signature)
       let nextCursor: string | undefined;
       if (hasMore) {
         const lastPostId = results[results.length - 1];
         const lastScore = await redis.zscore(key, lastPostId);
         if (lastScore) {
-          nextCursor = this.encodeCursor({
-            timestamp: parseInt(lastScore),
-            postId: lastPostId,
-          });
+          nextCursor = this.encodeCursor(
+            {
+              timestamp: parseInt(lastScore),
+              postId: lastPostId,
+            },
+            userId
+          );
         }
       }
 
@@ -264,20 +268,46 @@ export class CacheService {
   }
 
   /**
-   * Encode cursor (Base64)
+   * Encode cursor with HMAC signature (prevents forgery)
    */
-  private encodeCursor(data: { timestamp: number; postId: string }): string {
-    return Buffer.from(JSON.stringify(data)).toString('base64');
+  private encodeCursor(data: { timestamp: number; postId: string }, userId: string): string {
+    const payload = JSON.stringify(data);
+
+    // Create HMAC signature using userId as context
+    const signature = crypto
+      .createHmac('sha256', config.jwt.secret)
+      .update(`${userId}:${payload}`)
+      .digest('hex');
+
+    // Combine payload and signature
+    const combined = JSON.stringify({ payload, signature });
+    return Buffer.from(combined).toString('base64');
   }
 
   /**
-   * Decode cursor
+   * Decode and verify cursor signature
    */
-  private decodeCursor(cursor: string): { timestamp: number; postId: string } {
+  private decodeCursor(cursor: string, userId: string): { timestamp: number; postId: string } {
     try {
+      // Decode base64
       const decoded = Buffer.from(cursor, 'base64').toString('utf-8');
-      return JSON.parse(decoded);
+      const { payload, signature } = JSON.parse(decoded);
+
+      // Verify signature
+      const expectedSignature = crypto
+        .createHmac('sha256', config.jwt.secret)
+        .update(`${userId}:${payload}`)
+        .digest('hex');
+
+      // Constant-time comparison to prevent timing attacks
+      if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature))) {
+        throw new Error('Invalid cursor signature');
+      }
+
+      // Parse and return data
+      return JSON.parse(payload);
     } catch (error) {
+      logger.warn(`Invalid cursor for user ${userId}:`, error);
       throw new Error('Invalid cursor');
     }
   }

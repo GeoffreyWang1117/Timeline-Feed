@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import { connectMongoDB } from './config/database';
 import { logger } from './utils/logger';
+import { validateEnvironment, sanitizeConfig } from './utils/validateEnv';
 import { errorHandler } from './middlewares/errorHandler';
 import { globalRateLimiter } from './middlewares/rateLimiter';
 import { kafkaService } from './services/KafkaService';
@@ -72,6 +73,12 @@ class App {
 
   public async start(): Promise<void> {
     try {
+      // Validate environment variables
+      validateEnvironment();
+
+      // Log sanitized configuration (no sensitive data)
+      logger.info('Configuration:', sanitizeConfig(config));
+
       // Connect to MongoDB
       await connectMongoDB();
       logger.info('MongoDB connected');
