@@ -4,6 +4,13 @@ import { postController } from '../controllers/PostController';
 import { userController } from '../controllers/UserController';
 import { authenticate, optionalAuth } from '../middlewares/auth';
 import { rateLimiter, strictRateLimiter } from '../middlewares/rateLimiter';
+import {
+  validateUUID,
+  validateContent,
+  validateMediaUrls,
+  validateCursor,
+  validatePagination,
+} from '../middlewares/validation';
 
 const router = Router();
 
@@ -19,22 +26,22 @@ router.get('/health', (req, res) => {
 // User routes
 router.post('/users/register', strictRateLimiter, userController.register);
 router.post('/users/login', strictRateLimiter, userController.login);
-router.post('/users/:userId/follow', authenticate, rateLimiter(), userController.followUser);
-router.delete('/users/:userId/follow', authenticate, rateLimiter(), userController.unfollowUser);
-router.get('/users/:userId/followers', optionalAuth, userController.getFollowers);
-router.get('/users/:userId/following', optionalAuth, userController.getFollowing);
-router.get('/users/:userId', optionalAuth, userController.getProfile);
-router.get('/users/:userId/posts', optionalAuth, postController.getUserPosts);
+router.post('/users/:userId/follow', authenticate, validateUUID('userId'), rateLimiter(), userController.followUser);
+router.delete('/users/:userId/follow', authenticate, validateUUID('userId'), rateLimiter(), userController.unfollowUser);
+router.get('/users/:userId/followers', optionalAuth, validateUUID('userId'), validatePagination(), userController.getFollowers);
+router.get('/users/:userId/following', optionalAuth, validateUUID('userId'), validatePagination(), userController.getFollowing);
+router.get('/users/:userId', optionalAuth, validateUUID('userId'), userController.getProfile);
+router.get('/users/:userId/posts', optionalAuth, validateUUID('userId'), validatePagination(), postController.getUserPosts);
 
 // Timeline routes
-router.get('/timeline', authenticate, rateLimiter(), timelineController.getTimeline);
-router.get('/timeline/trending', optionalAuth, timelineController.getTrending);
+router.get('/timeline', authenticate, validateCursor(), rateLimiter(), timelineController.getTimeline);
+router.get('/timeline/trending', optionalAuth, validateCursor(), timelineController.getTrending);
 router.post('/timeline/refresh', authenticate, strictRateLimiter, timelineController.refreshTimeline);
 
 // Post routes
-router.post('/posts', authenticate, rateLimiter(), postController.createPost);
-router.get('/posts/:postId', optionalAuth, postController.getPost);
-router.post('/posts/:postId/like', authenticate, rateLimiter(), postController.likePost);
-router.delete('/posts/:postId', authenticate, rateLimiter(), postController.deletePost);
+router.post('/posts', authenticate, validateContent(), validateMediaUrls(), rateLimiter(), postController.createPost);
+router.get('/posts/:postId', optionalAuth, validateUUID('postId'), postController.getPost);
+router.post('/posts/:postId/like', authenticate, validateUUID('postId'), rateLimiter(), postController.likePost);
+router.delete('/posts/:postId', authenticate, validateUUID('postId'), rateLimiter(), postController.deletePost);
 
 export default router;

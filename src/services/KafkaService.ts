@@ -3,6 +3,7 @@ import { Producer, Consumer, EachMessagePayload } from 'kafkajs';
 import { logger } from '../utils/logger';
 import { FanoutMessage } from '../types';
 import config from '../config';
+import pRetry from 'p-retry';
 
 export class KafkaService {
   private producer: Producer | null = null;
@@ -42,91 +43,124 @@ export class KafkaService {
   }
 
   /**
-   * Publish new post event
+   * Publish new post event (with retry)
    */
   async publishNewPost(message: FanoutMessage): Promise<void> {
-    try {
-      if (!this.producer) {
-        await this.initProducer();
+    return await pRetry(
+      async () => {
+        if (!this.producer) {
+          await this.initProducer();
+        }
+
+        await this.producer!.send({
+          topic: KAFKA_TOPICS.NEW_POST,
+          messages: [
+            {
+              key: message.userId,
+              value: JSON.stringify(message),
+              timestamp: Date.now().toString(),
+            },
+          ],
+        });
+
+        logger.debug(`Published new post event: ${message.postId}`);
+      },
+      {
+        retries: 3,
+        minTimeout: 1000,
+        maxTimeout: 5000,
+        factor: 2,
+        onFailedAttempt: (error) => {
+          logger.warn(
+            `Kafka publish retry ${error.attemptNumber}/${error.retriesLeft} remaining for post ${message.postId}`,
+            { error: error.message }
+          );
+        },
       }
-
-      await this.producer!.send({
-        topic: KAFKA_TOPICS.NEW_POST,
-        messages: [
-          {
-            key: message.userId,
-            value: JSON.stringify(message),
-            timestamp: Date.now().toString(),
-          },
-        ],
-      });
-
-      logger.debug(`Published new post event: ${message.postId}`);
-    } catch (error) {
-      logger.error('Error publishing new post:', error);
-      throw error;
-    }
+    );
   }
 
   /**
-   * Publish fanout complete event
+   * Publish fanout complete event (with retry)
    */
   async publishFanoutComplete(postId: string, userId: string, followerCount: number): Promise<void> {
-    try {
-      if (!this.producer) {
-        await this.initProducer();
+    return await pRetry(
+      async () => {
+        if (!this.producer) {
+          await this.initProducer();
+        }
+
+        await this.producer!.send({
+          topic: KAFKA_TOPICS.FANOUT_COMPLETE,
+          messages: [
+            {
+              key: postId,
+              value: JSON.stringify({
+                postId,
+                userId,
+                followerCount,
+                completedAt: Date.now(),
+              }),
+            },
+          ],
+        });
+
+        logger.debug(`Published fanout complete event: ${postId}`);
+      },
+      {
+        retries: 3,
+        minTimeout: 1000,
+        maxTimeout: 5000,
+        factor: 2,
+        onFailedAttempt: (error) => {
+          logger.warn(
+            `Kafka publish retry ${error.attemptNumber}/${error.retriesLeft} remaining for fanout complete ${postId}`,
+            { error: error.message }
+          );
+        },
       }
-
-      await this.producer!.send({
-        topic: KAFKA_TOPICS.FANOUT_COMPLETE,
-        messages: [
-          {
-            key: postId,
-            value: JSON.stringify({
-              postId,
-              userId,
-              followerCount,
-              completedAt: Date.now(),
-            }),
-          },
-        ],
-      });
-
-      logger.debug(`Published fanout complete event: ${postId}`);
-    } catch (error) {
-      logger.error('Error publishing fanout complete:', error);
-      throw error;
-    }
+    );
   }
 
   /**
-   * Publish hot content event
+   * Publish hot content event (with retry)
    */
   async publishHotContent(postId: string, metrics: any): Promise<void> {
-    try {
-      if (!this.producer) {
-        await this.initProducer();
+    return await pRetry(
+      async () => {
+        if (!this.producer) {
+          await this.initProducer();
+        }
+
+        await this.producer!.send({
+          topic: KAFKA_TOPICS.HOT_CONTENT,
+          messages: [
+            {
+              key: postId,
+              value: JSON.stringify({
+                postId,
+                metrics,
+                detectedAt: Date.now(),
+              }),
+            },
+          ],
+        });
+
+        logger.debug(`Published hot content event: ${postId}`);
+      },
+      {
+        retries: 3,
+        minTimeout: 1000,
+        maxTimeout: 5000,
+        factor: 2,
+        onFailedAttempt: (error) => {
+          logger.warn(
+            `Kafka publish retry ${error.attemptNumber}/${error.retriesLeft} remaining for hot content ${postId}`,
+            { error: error.message }
+          );
+        },
       }
-
-      await this.producer!.send({
-        topic: KAFKA_TOPICS.HOT_CONTENT,
-        messages: [
-          {
-            key: postId,
-            value: JSON.stringify({
-              postId,
-              metrics,
-              detectedAt: Date.now(),
-            }),
-          },
-        ],
-      });
-
-      logger.debug(`Published hot content event: ${postId}`);
-    } catch (error) {
-      logger.error('Error publishing hot content:', error);
-      throw error;
-    }
+    );
   }
 
   /**
