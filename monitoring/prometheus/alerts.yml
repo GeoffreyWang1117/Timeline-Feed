@@ -1,0 +1,173 @@
+groups:
+  - name: timeline_feed_alerts
+    interval: 30s
+    rules:
+      # API Performance Alerts
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_ms_bucket[5m])) by (le)) > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "High API response time detected"
+          description: "P95 response time is {{ $value }}ms (threshold: 100ms)"
+
+      - alert: CriticalResponseTime
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_ms_bucket[5m])) by (le)) > 500
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "Critical API response time detected"
+          description: "P95 response time is {{ $value }}ms (threshold: 500ms)"
+
+      # Error Rate Alerts
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 1%)"
+
+      - alert: CriticalErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "Critical error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+      # Circuit Breaker Alerts
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state{breaker_name="redis-operations"} == 2
+        for: 1m
+        labels:
+          severity: critical
+          component: redis
+        annotations:
+          summary: "Redis circuit breaker is OPEN"
+          description: "Circuit breaker {{ $labels.breaker_name }} has been open for more than 1 minute"
+
+      - alert: CircuitBreakerHalfOpen
+        expr: circuit_breaker_state{breaker_name="redis-operations"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "Redis circuit breaker is HALF-OPEN"
+          description: "Circuit breaker {{ $labels.breaker_name }} has been half-open for more than 5 minutes"
+
+      # Cache Performance Alerts
+      - alert: LowCacheHitRate
+        expr: cache_hit_rate{cache_type="post"} < 0.7
+        for: 10m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "Low cache hit rate detected"
+          description: "Cache hit rate for {{ $labels.cache_type }} is {{ $value | humanizePercentage }} (threshold: 70%)"
+
+      - alert: CriticalCacheHitRate
+        expr: cache_hit_rate{cache_type="post"} < 0.5
+        for: 5m
+        labels:
+          severity: critical
+          component: cache
+        annotations:
+          summary: "Critical cache hit rate detected"
+          description: "Cache hit rate for {{ $labels.cache_type }} is {{ $value | humanizePercentage }} (threshold: 50%)"
+
+      # Redis Operations Alerts
+      - alert: HighRedisOperationDuration
+        expr: histogram_quantile(0.95, sum(rate(redis_operation_duration_ms_bucket[5m])) by (le, operation)) > 50
+        for: 5m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "High Redis operation duration"
+          description: "P95 duration for {{ $labels.operation }} is {{ $value }}ms (threshold: 50ms)"
+
+      # Kafka Alerts
+      - alert: HighKafkaPublishFailureRate
+        expr: sum(rate(kafka_publishes_total{status="failure"}[5m])) / sum(rate(kafka_publishes_total[5m])) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "High Kafka publish failure rate"
+          description: "Kafka publish failure rate is {{ $value | humanizePercentage }} (threshold: 1%)"
+
+      - alert: SlowKafkaPublish
+        expr: histogram_quantile(0.95, sum(rate(kafka_publish_duration_ms_bucket[5m])) by (le, topic)) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "Slow Kafka publish operations"
+          description: "P95 publish duration for {{ $labels.topic }} is {{ $value }}ms (threshold: 1000ms)"
+
+      # System Resource Alerts
+      - alert: HighMemoryUsage
+        expr: system_memory_usage_bytes{type="heapUsed"} / system_memory_usage_bytes{type="heapTotal"} > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "High memory usage detected"
+          description: "Heap memory usage is {{ $value | humanizePercentage }} (threshold: 90%)"
+
+      - alert: CriticalMemoryUsage
+        expr: system_memory_usage_bytes{type="heapUsed"} / system_memory_usage_bytes{type="heapTotal"} > 0.95
+        for: 2m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Critical memory usage detected"
+          description: "Heap memory usage is {{ $value | humanizePercentage }} (threshold: 95%)"
+
+      # Request Rate Alerts
+      - alert: AnomalousRequestRate
+        expr: abs(rate(http_requests_total[5m]) - avg_over_time(rate(http_requests_total[5m])[1h:5m])) > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "Anomalous request rate detected"
+          description: "Request rate deviation: {{ $value }} req/s from average"
+
+      # Business Metrics Alerts
+      - alert: NoPostsCreated
+        expr: rate(posts_created_total[15m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: "No posts created recently"
+          description: "No new posts have been created in the last 15 minutes"
+
+      # Health Check Alerts
+      - alert: ServiceDown
+        expr: up{job="timeline-feed"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Timeline Feed service is down"
+          description: "The Timeline Feed service has been down for more than 1 minute"

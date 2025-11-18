@@ -46,7 +46,8 @@
     "sanitize-html": "^2.11.0",
     "p-retry": "^6.1.0",
     "opossum": "^8.1.1",
-    "validator": "^13.11.0"
+    "validator": "^13.11.0",
+    "prom-client": "^15.1.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

@@ -4,6 +4,7 @@ import { logger } from '../utils/logger';
 import { FanoutMessage } from '../types';
 import config from '../config';
 import pRetry from 'p-retry';
+import { metricsCollector } from '../utils/metrics';
 
 export class KafkaService {
   private producer: Producer | null = null;
@@ -46,38 +47,48 @@ export class KafkaService {
    * Publish new post event (with retry)
    */
   async publishNewPost(message: FanoutMessage): Promise<void> {
-    return await pRetry(
-      async () => {
-        if (!this.producer) {
-          await this.initProducer();
-        }
+    const start = Date.now();
+    try {
+      await pRetry(
+        async () => {
+          if (!this.producer) {
+            await this.initProducer();
+          }
 
-        await this.producer!.send({
-          topic: KAFKA_TOPICS.NEW_POST,
-          messages: [
-            {
-              key: message.userId,
-              value: JSON.stringify(message),
-              timestamp: Date.now().toString(),
-            },
-          ],
-        });
+          await this.producer!.send({
+            topic: KAFKA_TOPICS.NEW_POST,
+            messages: [
+              {
+                key: message.userId,
+                value: JSON.stringify(message),
+                timestamp: Date.now().toString(),
+              },
+            ],
+          });
 
-        logger.debug(`Published new post event: ${message.postId}`);
-      },
-      {
-        retries: 3,
-        minTimeout: 1000,
-        maxTimeout: 5000,
-        factor: 2,
-        onFailedAttempt: (error) => {
-          logger.warn(
-            `Kafka publish retry ${error.attemptNumber}/${error.retriesLeft} remaining for post ${message.postId}`,
-            { error: error.message }
-          );
+          logger.debug(`Published new post event: ${message.postId}`);
         },
-      }
-    );
+        {
+          retries: 3,
+          minTimeout: 1000,
+          maxTimeout: 5000,
+          factor: 2,
+          onFailedAttempt: (error) => {
+            logger.warn(
+              `Kafka publish retry ${error.attemptNumber}/${error.retriesLeft} remaining for post ${message.postId}`,
+              { error: error.message }
+            );
+          },
+        }
+      );
+
+      const duration = Date.now() - start;
+      metricsCollector.recordKafkaPublish(KAFKA_TOPICS.NEW_POST, duration, true);
+    } catch (error) {
+      const duration = Date.now() - start;
+      metricsCollector.recordKafkaPublish(KAFKA_TOPICS.NEW_POST, duration, false);
+      throw error;
+    }
   }
 
   /**

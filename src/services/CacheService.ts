@@ -4,6 +4,7 @@ import config from '../config';
 import { TimelinePost, HotContentMetrics } from '../types';
 import crypto from 'crypto';
 import CircuitBreaker from 'opossum';
+import { metricsCollector } from '../utils/metrics';
 
 export class CacheService {
   private circuitBreaker: CircuitBreaker;
@@ -22,18 +23,29 @@ export class CacheService {
     // Circuit breaker event listeners
     this.circuitBreaker.on('open', () => {
       logger.error('Redis circuit breaker OPENED - Redis may be unavailable');
+      metricsCollector.updateCircuitBreakerState('redis-operations', 'open');
     });
 
     this.circuitBreaker.on('halfOpen', () => {
       logger.warn('Redis circuit breaker HALF-OPEN - Testing Redis availability');
+      metricsCollector.updateCircuitBreakerState('redis-operations', 'half-open');
     });
 
     this.circuitBreaker.on('close', () => {
       logger.info('Redis circuit breaker CLOSED - Redis connection restored');
+      metricsCollector.updateCircuitBreakerState('redis-operations', 'closed');
     });
 
     this.circuitBreaker.on('fallback', (result) => {
       logger.warn('Redis circuit breaker fallback triggered', { result });
+    });
+
+    this.circuitBreaker.on('success', () => {
+      metricsCollector.recordCircuitBreakerOperation('redis-operations', true);
+    });
+
+    this.circuitBreaker.on('failure', () => {
+      metricsCollector.recordCircuitBreakerOperation('redis-operations', false);
     });
 
     // Fallback function - return safe defaults when circuit is open
@@ -196,15 +208,27 @@ export class CacheService {
    */
   async getCachedPost(postId: string): Promise<any | null> {
     try {
+      const start = Date.now();
       const result = await this.circuitBreaker.fire(async () => {
         const key = REDIS_KEYS.POST(postId);
         const data = await redis.get(key);
         return data ? JSON.parse(data) : null;
       });
 
+      const duration = Date.now() - start;
+      metricsCollector.recordRedisOperation('get', duration, true);
+
+      // Record cache hit/miss
+      if (result) {
+        metricsCollector.recordCacheAccess('post', true);
+      } else {
+        metricsCollector.recordCacheAccess('post', false);
+      }
+
       return result;
     } catch (error) {
       logger.error('Error getting cached post:', error);
+      metricsCollector.recordCacheAccess('post', false);
       return null; // Cache miss on error
     }
   }
