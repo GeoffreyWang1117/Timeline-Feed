@@ -246,6 +246,120 @@ export class FollowService {
     const user = await User.findOne({ userId }).select('followingCount').lean();
     return user?.followingCount || 0;
   }
+
+  /**
+   * Get followers with user details (optimized with aggregation - fixes N+1)
+   * Single query instead of 2 separate queries
+   */
+  async getFollowersWithDetails(
+    userId: string,
+    limit = 100,
+    offset = 0
+  ): Promise<Array<{
+    userId: string;
+    username: string;
+    displayName: string;
+    avatarUrl?: string;
+    isVerified: boolean;
+  }>> {
+    try {
+      const followers = await Follow.aggregate([
+        // Match followers of the target user
+        { $match: { followingId: userId } },
+
+        // Pagination
+        { $skip: offset },
+        { $limit: limit },
+
+        // Join with User collection to get follower details
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'followerId',
+            foreignField: 'userId',
+            as: 'followerUser',
+          },
+        },
+
+        // Unwind the array
+        { $unwind: '$followerUser' },
+
+        // Project only needed fields
+        {
+          $project: {
+            _id: 0,
+            userId: '$followerUser.userId',
+            username: '$followerUser.username',
+            displayName: '$followerUser.displayName',
+            avatarUrl: '$followerUser.avatarUrl',
+            isVerified: '$followerUser.isVerified',
+          },
+        },
+      ]);
+
+      return followers;
+    } catch (error) {
+      logger.error('Error getting followers with details:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get following with user details (optimized with aggregation - fixes N+1)
+   * Single query instead of 2 separate queries
+   */
+  async getFollowingWithDetails(
+    userId: string,
+    limit = 100,
+    offset = 0
+  ): Promise<Array<{
+    userId: string;
+    username: string;
+    displayName: string;
+    avatarUrl?: string;
+    isVerified: boolean;
+  }>> {
+    try {
+      const following = await Follow.aggregate([
+        // Match users that the target user is following
+        { $match: { followerId: userId } },
+
+        // Pagination
+        { $skip: offset },
+        { $limit: limit },
+
+        // Join with User collection to get following user details
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'followingId',
+            foreignField: 'userId',
+            as: 'followingUser',
+          },
+        },
+
+        // Unwind the array
+        { $unwind: '$followingUser' },
+
+        // Project only needed fields
+        {
+          $project: {
+            _id: 0,
+            userId: '$followingUser.userId',
+            username: '$followingUser.username',
+            displayName: '$followingUser.displayName',
+            avatarUrl: '$followingUser.avatarUrl',
+            isVerified: '$followingUser.isVerified',
+          },
+        },
+      ]);
+
+      return following;
+    } catch (error) {
+      logger.error('Error getting following with details:', error);
+      throw error;
+    }
+  }
 }
 
 export const followService = new FollowService();

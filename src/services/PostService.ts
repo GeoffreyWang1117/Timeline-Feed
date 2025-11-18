@@ -123,7 +123,7 @@ export class PostService {
   }
 
   /**
-   * Get multiple posts by IDs
+   * Get multiple posts by IDs (optimized - fixed N+1 query)
    */
   async getPostsByIds(postIds: string[], viewerId?: string): Promise<TimelinePost[]> {
     if (postIds.length === 0) {
@@ -132,19 +132,19 @@ export class PostService {
 
     try {
       const posts: TimelinePost[] = [];
-      const uncachedPostIds: string[] = [];
 
-      // Try to get from cache
-      for (const postId of postIds) {
-        const cached = await cacheService.getCachedPost(postId);
-        if (cached) {
-          posts.push(cached);
-        } else {
-          uncachedPostIds.push(postId);
-        }
-      }
+      // Batch get from cache (fixes N+1 query - single MGET instead of N GETs)
+      const cachedPostsMap = await cacheService.getCachedPosts(postIds);
 
-      // Fetch uncached posts from MongoDB
+      // Identify uncached posts
+      const uncachedPostIds = postIds.filter((id) => !cachedPostsMap.has(id));
+
+      // Add cached posts to result
+      cachedPostsMap.forEach((post) => {
+        posts.push(post);
+      });
+
+      // Fetch uncached posts from MongoDB in batch (already optimized)
       if (uncachedPostIds.length > 0) {
         const dbPosts = await Post.find({ postId: { $in: uncachedPostIds } }).lean();
         const userIds = [...new Set(dbPosts.map((p) => p.userId))];
@@ -159,13 +159,13 @@ export class PostService {
 
         posts.push(...timelinePosts);
 
-        // Cache them
+        // Cache them in batch
         await cacheService.cacheMultiplePosts(
           timelinePosts.map((p) => ({ postId: p.postId, data: p }))
         );
       }
 
-      // Track views
+      // Track views in parallel (already optimized)
       if (viewerId) {
         const trackingPromises = postIds.map((postId) =>
           Promise.all([

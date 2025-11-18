@@ -221,26 +221,27 @@ export class UserController {
 
   /**
    * GET /api/v1/users/:userId/followers
-   * Get user's followers
+   * Get user's followers (optimized with aggregation)
    */
   getFollowers = asyncHandler(async (req: AuthRequest, res: Response) => {
     const { userId } = req.params;
     const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
     const offset = parseInt(req.query.offset as string) || 0;
 
-    const followerIds = await followService.getFollowers(userId, limit, offset);
-    const followers = await User.find({ userId: { $in: followerIds } })
-      .select('userId username displayName avatarUrl isVerified')
-      .lean();
+    // Use optimized aggregation query (1 query instead of 2)
+    const followers = await followService.getFollowersWithDetails(userId, limit + 1, offset);
+
+    const hasMore = followers.length > limit;
+    const results = hasMore ? followers.slice(0, limit) : followers;
 
     res.json({
       success: true,
       data: {
-        followers,
+        followers: results,
         pagination: {
           limit,
           offset,
-          hasMore: followerIds.length === limit,
+          hasMore,
         },
       },
     });
@@ -248,26 +249,27 @@ export class UserController {
 
   /**
    * GET /api/v1/users/:userId/following
-   * Get users that a user is following
+   * Get users that a user is following (optimized with aggregation)
    */
   getFollowing = asyncHandler(async (req: AuthRequest, res: Response) => {
     const { userId } = req.params;
     const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
     const offset = parseInt(req.query.offset as string) || 0;
 
-    const followingIds = await followService.getFollowing(userId, limit, offset);
-    const following = await User.find({ userId: { $in: followingIds } })
-      .select('userId username displayName avatarUrl isVerified')
-      .lean();
+    // Use optimized aggregation query (1 query instead of 2)
+    const following = await followService.getFollowingWithDetails(userId, limit + 1, offset);
+
+    const hasMore = following.length > limit;
+    const results = hasMore ? following.slice(0, limit) : following;
 
     res.json({
       success: true,
       data: {
-        following,
+        following: results,
         pagination: {
           limit,
           offset,
-          hasMore: followingIds.length === limit,
+          hasMore,
         },
       },
     });

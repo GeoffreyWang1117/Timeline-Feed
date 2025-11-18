@@ -3,29 +3,76 @@ import { logger } from '../utils/logger';
 import config from '../config';
 import { TimelinePost, HotContentMetrics } from '../types';
 import crypto from 'crypto';
+import CircuitBreaker from 'opossum';
 
 export class CacheService {
+  private circuitBreaker: CircuitBreaker;
+
+  constructor() {
+    // Initialize circuit breaker for Redis operations
+    this.circuitBreaker = new CircuitBreaker(this.executeRedisOperation.bind(this), {
+      timeout: 3000, // 3 seconds timeout
+      errorThresholdPercentage: 50, // Open circuit at 50% error rate
+      resetTimeout: 30000, // Attempt to close after 30 seconds
+      rollingCountTimeout: 10000, // 10 second window for error calculation
+      rollingCountBuckets: 10, // Number of buckets in the window
+      name: 'redis-operations',
+    });
+
+    // Circuit breaker event listeners
+    this.circuitBreaker.on('open', () => {
+      logger.error('Redis circuit breaker OPENED - Redis may be unavailable');
+    });
+
+    this.circuitBreaker.on('halfOpen', () => {
+      logger.warn('Redis circuit breaker HALF-OPEN - Testing Redis availability');
+    });
+
+    this.circuitBreaker.on('close', () => {
+      logger.info('Redis circuit breaker CLOSED - Redis connection restored');
+    });
+
+    this.circuitBreaker.on('fallback', (result) => {
+      logger.warn('Redis circuit breaker fallback triggered', { result });
+    });
+
+    // Fallback function - return safe defaults when circuit is open
+    this.circuitBreaker.fallback(() => {
+      logger.debug('Using circuit breaker fallback for Redis operation');
+      return null;
+    });
+  }
+
   /**
-   * Add post to user's timeline cache (Redis Sorted Set)
+   * Execute Redis operation with circuit breaker protection
+   */
+  private async executeRedisOperation<T>(operation: () => Promise<T>): Promise<T> {
+    return await operation();
+  }
+  /**
+   * Add post to user's timeline cache (Redis Sorted Set) - with circuit breaker
    */
   async addToTimeline(userId: string, postId: string, timestamp: number): Promise<void> {
     try {
-      const key = REDIS_KEYS.TIMELINE(userId);
+      await this.circuitBreaker.fire(async () => {
+        const key = REDIS_KEYS.TIMELINE(userId);
 
-      // Add to sorted set (score = timestamp)
-      await redis.zadd(key, timestamp, postId);
+        // Add to sorted set (score = timestamp)
+        await redis.zadd(key, timestamp, postId);
 
-      // Trim to max size
-      const maxSize = config.cache.timelineCacheSize;
-      await redis.zremrangebyrank(key, 0, -(maxSize + 1));
+        // Trim to max size
+        const maxSize = config.cache.timelineCacheSize;
+        await redis.zremrangebyrank(key, 0, -(maxSize + 1));
 
-      // Set TTL
-      await redis.expire(key, CACHE_TTL.TIMELINE);
+        // Set TTL
+        await redis.expire(key, CACHE_TTL.TIMELINE);
 
-      logger.debug(`Added post ${postId} to timeline of user ${userId}`);
+        logger.debug(`Added post ${postId} to timeline of user ${userId}`);
+      });
     } catch (error) {
       logger.error('Error adding to timeline:', error);
-      throw error;
+      // Don't throw - gracefully degrade (post will still be in DB)
+      logger.warn(`Cache write failed for timeline ${userId}, continuing without cache`);
     }
   }
 
@@ -72,50 +119,61 @@ export class CacheService {
     cursor?: string
   ): Promise<{ postIds: string[]; nextCursor?: string }> {
     try {
-      const key = REDIS_KEYS.TIMELINE(userId);
+      const result = await this.circuitBreaker.fire(async () => {
+        const key = REDIS_KEYS.TIMELINE(userId);
 
-      let start = 0;
-      let maxScore = '+inf';
+        let start = 0;
+        let maxScore = '+inf';
 
-      // Parse cursor (with userId validation)
-      if (cursor) {
-        const cursorData = this.decodeCursor(cursor, userId);
-        maxScore = cursorData.timestamp.toString();
-      }
-
-      // Get posts from sorted set (reverse order - newest first)
-      const postIds = await redis.zrevrangebyscore(
-        key,
-        maxScore,
-        '-inf',
-        'LIMIT',
-        start,
-        limit + 1 // Fetch one extra to check if there are more
-      );
-
-      const hasMore = postIds.length > limit;
-      const results = hasMore ? postIds.slice(0, limit) : postIds;
-
-      // Generate next cursor (with userId signature)
-      let nextCursor: string | undefined;
-      if (hasMore) {
-        const lastPostId = results[results.length - 1];
-        const lastScore = await redis.zscore(key, lastPostId);
-        if (lastScore) {
-          nextCursor = this.encodeCursor(
-            {
-              timestamp: parseInt(lastScore),
-              postId: lastPostId,
-            },
-            userId
-          );
+        // Parse cursor (with userId validation)
+        if (cursor) {
+          const cursorData = this.decodeCursor(cursor, userId);
+          maxScore = cursorData.timestamp.toString();
         }
+
+        // Get posts from sorted set (reverse order - newest first)
+        const postIds = await redis.zrevrangebyscore(
+          key,
+          maxScore,
+          '-inf',
+          'LIMIT',
+          start,
+          limit + 1 // Fetch one extra to check if there are more
+        );
+
+        const hasMore = postIds.length > limit;
+        const results = hasMore ? postIds.slice(0, limit) : postIds;
+
+        // Generate next cursor (with userId signature)
+        let nextCursor: string | undefined;
+        if (hasMore) {
+          const lastPostId = results[results.length - 1];
+          const lastScore = await redis.zscore(key, lastPostId);
+          if (lastScore) {
+            nextCursor = this.encodeCursor(
+              {
+                timestamp: parseInt(lastScore),
+                postId: lastPostId,
+              },
+              userId
+            );
+          }
+        }
+
+        return { postIds: results, nextCursor };
+      });
+
+      // Handle fallback (circuit open)
+      if (result === null) {
+        logger.warn(`Timeline cache unavailable for user ${userId}, falling back to empty result`);
+        return { postIds: [] };
       }
 
-      return { postIds: results, nextCursor };
+      return result;
     } catch (error) {
       logger.error('Error getting timeline:', error);
-      throw error;
+      // Return empty result on error instead of throwing
+      return { postIds: [] };
     }
   }
 
@@ -134,16 +192,56 @@ export class CacheService {
   }
 
   /**
-   * Get cached post
+   * Get cached post (with circuit breaker protection)
    */
   async getCachedPost(postId: string): Promise<any | null> {
     try {
-      const key = REDIS_KEYS.POST(postId);
-      const data = await redis.get(key);
-      return data ? JSON.parse(data) : null;
+      const result = await this.circuitBreaker.fire(async () => {
+        const key = REDIS_KEYS.POST(postId);
+        const data = await redis.get(key);
+        return data ? JSON.parse(data) : null;
+      });
+
+      return result;
     } catch (error) {
       logger.error('Error getting cached post:', error);
-      return null;
+      return null; // Cache miss on error
+    }
+  }
+
+  /**
+   * Get multiple cached posts (batch operation with circuit breaker) - Fixes N+1 query
+   */
+  async getCachedPosts(postIds: string[]): Promise<Map<string, any>> {
+    if (postIds.length === 0) {
+      return new Map();
+    }
+
+    try {
+      const result = await this.circuitBreaker.fire(async () => {
+        // Use MGET for batch retrieval
+        const keys = postIds.map((id) => REDIS_KEYS.POST(id));
+        const values = await redis.mget(...keys);
+
+        const postMap = new Map<string, any>();
+        postIds.forEach((postId, index) => {
+          if (values[index]) {
+            try {
+              postMap.set(postId, JSON.parse(values[index]!));
+            } catch (error) {
+              logger.warn(`Failed to parse cached post ${postId}:`, error);
+            }
+          }
+        });
+
+        logger.debug(`Batch fetched ${postMap.size}/${postIds.length} posts from cache`);
+        return postMap;
+      });
+
+      return result || new Map();
+    } catch (error) {
+      logger.error('Error getting cached posts in batch:', error);
+      return new Map(); // Return empty map on error
     }
   }
 
@@ -228,15 +326,19 @@ export class CacheService {
   }
 
   /**
-   * Get trending posts
+   * Get trending posts (with circuit breaker protection)
    */
   async getTrendingPosts(limit = 100): Promise<string[]> {
     try {
-      const key = REDIS_KEYS.TRENDING_POSTS;
-      return await redis.zrevrange(key, 0, limit - 1);
+      const result = await this.circuitBreaker.fire(async () => {
+        const key = REDIS_KEYS.TRENDING_POSTS;
+        return await redis.zrevrange(key, 0, limit - 1);
+      });
+
+      return result || [];
     } catch (error) {
       logger.error('Error getting trending posts:', error);
-      return [];
+      return []; // Return empty array on error
     }
   }
 
