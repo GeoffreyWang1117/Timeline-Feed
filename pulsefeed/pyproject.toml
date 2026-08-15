@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsefeed"
+version = "0.1.0"
+description = "Event-triggered LLM enrichment for real-time activity feeds"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = [
+    "llm",
+    "streaming",
+    "admission-control",
+    "backpressure",
+    "observability",
+    "timeline",
+]
+
+# The core is deliberately dependency-free: scoring, coalescing, triggering,
+# scheduling, summarising and the whole replay harness run on the standard
+# library alone. Everything below is optional and additive.
+dependencies = []
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2.5"]
+llm = ["httpx>=0.26"]
+metrics = ["prometheus-client>=0.19"]
+store = ["asyncpg>=0.29", "redis>=5.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.3"]
+all = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.5",
+    "httpx>=0.26",
+    "prometheus-client>=0.19",
+]
+
+[project.scripts]
+pulsefeed-replay = "harness.replay:main"
+pulsefeed-frontier = "harness.frontier:main"
+pulsefeed-chaos = "harness.failure_injection:main"
+
+[tool.setuptools]
+packages = ["pulsefeed", "pulsefeed.llm", "harness"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008"]

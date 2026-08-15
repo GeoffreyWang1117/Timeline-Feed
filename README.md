@@ -16,6 +16,27 @@ Built with high performance, security, and observability in mind. Featuring comp
 
 ---
 
+## 🔊 Also in this repository: PulseFeed
+
+**[`pulsefeed/`](./pulsefeed/)** — *Event-triggered LLM enrichment for real-time
+activity feeds.*
+
+A separate Python service that takes the same ingest → queue → worker → timeline
+shape in a different direction: instead of ranking posts by recency, it decides
+*which events are worth an LLM call at all*, treating model invocation as a
+scarce online control action governed by budget, queue depth and freshness
+deadlines.
+
+On a seeded 6,396-event trace it uses **98.5% fewer LLM calls than enriching
+everything** (72 vs 4,905) at slightly better recall@20, with a peak queue depth
+of 1 against 1,748 — and the feed keeps working with the provider entirely down.
+
+The TypeScript service below is unchanged; the two run side by side. See
+[`pulsefeed/README.md`](./pulsefeed/README.md) for results and
+[`pulsefeed/DESIGN.md`](./pulsefeed/DESIGN.md) for the design rationale.
+
+---
+
 ## ✨ Key Features
 
 ### 🚀 Performance

@@ -1,0 +1,61 @@
+"""Provider layer: the boundary between PulseFeed and an unreliable dependency."""
+
+from .circuit_breaker import (
+    BreakerConfig,
+    BreakerState,
+    CircuitBreaker,
+    CircuitOpenError,
+    RetryBudget,
+)
+from .prompts import (
+    ANNOTATION_SCHEMA,
+    SYSTEM_PROMPT,
+    EnrichmentRequest,
+    ValidationError,
+    redact_secrets,
+    sanitize_content,
+    validate_annotation_payload,
+)
+from .provider import (
+    EnrichmentOutcome,
+    EnrichmentUnavailable,
+    LLMProvider,
+    MockConfig,
+    MockProvider,
+    OpenAICompatibleProvider,
+    OpenAIConfig,
+    ProviderError,
+    ProviderResult,
+    ProviderTimeout,
+    ProviderUnavailable,
+    ResilienceConfig,
+    ResilientProvider,
+)
+
+__all__ = [
+    "BreakerConfig",
+    "BreakerState",
+    "CircuitBreaker",
+    "CircuitOpenError",
+    "RetryBudget",
+    "ANNOTATION_SCHEMA",
+    "SYSTEM_PROMPT",
+    "EnrichmentRequest",
+    "ValidationError",
+    "redact_secrets",
+    "sanitize_content",
+    "validate_annotation_payload",
+    "EnrichmentOutcome",
+    "EnrichmentUnavailable",
+    "LLMProvider",
+    "MockConfig",
+    "MockProvider",
+    "OpenAICompatibleProvider",
+    "OpenAIConfig",
+    "ProviderError",
+    "ProviderResult",
+    "ProviderTimeout",
+    "ProviderUnavailable",
+    "ResilienceConfig",
+    "ResilientProvider",
+]
