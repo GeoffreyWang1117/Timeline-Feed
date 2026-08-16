@@ -22,6 +22,7 @@ PulseFeed 把「调用 LLM」当作一个**在线控制动作**：针对每个�
 |---|---|
 | [architecture.md](../architecture.md) | 想了解有哪些组件、一个事件怎么流过它们 |
 | [tuning.md](../tuning.md) | 要改阈值、窗口、预算、队列大小 |
+| [deployment.md](deployment.md) | **要把它部署到真机**：安装、systemd、TLS、GPU 机、备份恢复（中文） |
 | [operations.md](../operations.md) | 正在运行它，而且出问题了 |
 | [api.md](../api.md) | 要调 HTTP 接口 |
 | [training.md](../training.md) | 要训练或部署学习版 scorer |
@@ -36,7 +37,7 @@ PulseFeed 把「调用 LLM」当作一个**在线控制动作**：针对每个�
 ```bash
 cd pulsefeed
 python demo.py                       # 15 条事件进去，一个事故故事出来，附成本
-python -m pytest tests/ -q           # 234 个测试
+python -m pytest tests/ -q           # 245 个测试
 python -m harness.replay             # A/B/C/D 对比实验
 python -m harness.frontier           # 成本-质量前沿扫描
 python -m harness.failure_injection  # 故障注入
@@ -161,7 +162,7 @@ Feed 内容**按定义就是不可信输入** —— 任何能在被监听频道
 2. **mock provider 不是语言模型。** 它做真实的分析（读 cluster、用实体记忆、识别 deploy→劣化→回滚 的顺序），所以 LLM 组的优势来自真实的结构性事实；但它的文字是机械的，**这里没有任何东西测量了摘要质量**。
 3. **K=20 上排序落后**（84.2% vs 94.7%）。已诊断，未修复。
 4. **学习版 scorer 从未见过真实流量，也从未在 GPU 上跑过。**
-5. **单进程。** 按 `tenant_id`/`entity_id` 分片是设计意图，不是运行中的代码。
+5. **单进程。** 按 `tenant_id`/`entity_id` 分片是设计意图，不是运行中的代码——今天什么能扩、什么不能，在[部署指南 §10](deployment.md#10-扩展的边界加副本之前必读) 里写得很清楚。
 6. **认证默认关闭。** 设置 `PULSEFEED_API_KEYS` 后，**key 决定租户**（绑定 `acme` 的 key 无论请求体怎么声明都只能作为 `acme` 行动），并按租户做读写分离的令牌桶限流（超限 429 + `Retry-After`）。不设置则是全开的开发模式 —— `/readyz` 会明确报告这一点，因为一个裸奔的公网部署不应该看起来和正常配置一模一样。
 
 ---

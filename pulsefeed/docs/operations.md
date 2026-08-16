@@ -6,9 +6,15 @@ A runbook. What to look at, what it means, and what to do about it.
 
 ## 1. Deploying
 
+The full real-machine walkthrough — sizing, systemd, TLS, the GPU box, backup
+and restore — is **[deployment.md](deployment.md)**. The short version:
+
 ```bash
 pip install -e '.[all,store]'
 docker compose up -d                     # redis + postgres with pgvector
+cp .env.example .env                     # every variable documented inline
+set -a && source .env && set +a
+pulsefeed-preflight                      # verify what you configured actually works
 uvicorn pulsefeed.api:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
@@ -20,6 +26,12 @@ uvicorn pulsefeed.api:create_app --factory --host 0.0.0.0 --port 8000
 | `PULSEFEED_LLM_BASE_URL` | OpenAI | any OpenAI-compatible endpoint |
 | `PULSEFEED_LLM_MODEL` | `gpt-4o-mini` | primary model |
 | `PULSEFEED_LOCAL_LLM_BASE_URL` | — | fallback (e.g. local vLLM) |
+| `PULSEFEED_PG_DSN` | — | Postgres record of truth; unset = memory-only, **set-but-broken = refuse to boot** |
+| `PULSEFEED_RESTORE` | 1 | restore state from the sink at boot |
+| `PULSEFEED_RESTORE_TENANTS` | `PULSEFEED_TENANT` | comma-separated tenants to restore |
+| `PULSEFEED_REDIS_URL` | — | Redis Streams bus; POST publishes to it, 503 when it is down |
+| `PULSEFEED_STREAM` | `pulsefeed:events` | stream key |
+| `PULSEFEED_CONSUMER` | hostname-pid | consumer name in the group |
 | `PULSEFEED_SCORER_MODEL` | — | path to a fitted scorer JSON |
 | `PULSEFEED_WORKERS` | 4 | concurrent enrichments |
 | `PULSEFEED_AUDIT_RATE` | 0.01 | audit sampling rate |
@@ -32,13 +44,17 @@ uvicorn pulsefeed.api:create_app --factory --host 0.0.0.0 --port 8000
 **Nothing above is required.** With no provider configured the system falls back
 to a deterministic mock; with no `PULSEFEED_SCORER_MODEL` it uses hand-tuned
 weights. It starts and serves either way — deliberately, because a feed that
-refuses to boot without an LLM has the dependency exactly backwards.
+refuses to boot without an LLM has the dependency exactly backwards. The one
+deliberate exception: a *configured but unreachable* `PULSEFEED_PG_DSN` fails
+the boot, because an operator who asked for durability must not silently get a
+memory-only deployment.
 
 ### Verifying a deploy
 
 ```bash
+pulsefeed-preflight               # checks everything configured, exit 0/1
 curl -s localhost:8000/healthz    # {"status":"ok"}
-curl -s localhost:8000/readyz     # enrichment + breaker + scorer state
+curl -s localhost:8000/readyz     # enrichment + breaker + scorer + durability state
 curl -s localhost:8000/metrics    # Prometheus exposition
 ```
 
@@ -50,6 +66,12 @@ hand-tuned deploy without this field.
 It also reports `"auth": "enabled"` or `"disabled (dev mode)"`. **An
 internet-facing deployment showing dev mode is a misconfiguration** that would
 otherwise look exactly like a working setup.
+
+`"durability"` works the same way: `{"sink": "postgres", "bus": "redis"}` on a
+production box, plus `bus_lag` (unacknowledged deliveries — alert on it) and
+the consumer's ingest counters when the bus is configured. `"sink": "memory"`
+on a machine that was supposed to be durable means the DSN never reached the
+process environment.
 
 ---
 
@@ -226,6 +248,11 @@ running, since the serving path never depended on it.
 ---
 
 ## 6. Restart
+
+The API server does this automatically at boot when `PULSEFEED_PG_DSN` is set:
+each tenant in `PULSEFEED_RESTORE_TENANTS` is restored before the first request
+is served (disable with `PULSEFEED_RESTORE=0`). Embedding the pipeline
+yourself, the same sequence is:
 
 ```python
 pipeline = create_pipeline()

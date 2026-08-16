@@ -6,3 +6,5 @@ __pycache__/
 venv/
 results*.json
 frontier*.json
+dump.rdb
+.env

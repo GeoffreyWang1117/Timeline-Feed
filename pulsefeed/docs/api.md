@@ -45,8 +45,17 @@ Send the key as `X-API-Key`. Semantics worth knowing:
 
 ### `POST /v1/events`
 
-Accepts one event. **Returns as soon as it is scored and routed — never waits on
-the LLM.** `202 Accepted` means durably accepted for processing, not enriched.
+Accepts one event. **Returns as soon as it is accepted — never waits on the
+LLM.** What `202 Accepted` means depends on how the server is deployed:
+
+- **Bus mode** (`PULSEFEED_REDIS_URL` set): the event is in Redis before the
+  202 — durably accepted, ingested asynchronously with at-least-once
+  delivery. A bus outage returns **503** (fail closed; retry or buffer
+  upstream) rather than accept-and-forget.
+- **Direct mode** (no bus): the event is scored and routed in-process before
+  the 202 — lower latency, but an event in flight during a crash is lost.
+
+Either way, 202 never means "enriched".
 
 ```json
 {
@@ -226,6 +235,9 @@ events with no summaries is doing its job. Use this for liveness.
   "scorer": "LogisticScoreModel",
   "queue_depth": 3,
   "breakers": {"mock": "open"},
+  "auth": "enabled",
+  "durability": {"sink": "postgres", "bus": "redis", "sink_failures": 0,
+                 "bus_lag": 0, "ingest": {"consumed": 512, "acked": 512}},
   "prometheus": true
 }
 ```

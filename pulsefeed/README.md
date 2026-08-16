@@ -244,7 +244,7 @@ runs on the standard library.
 cd pulsefeed
 
 python demo.py                      # the worked example, annotated
-python -m pytest tests/ -q          # 234 tests
+python -m pytest tests/ -q          # 245 tests
 python -m harness.replay            # the A/B/C/D experiment
 python -m harness.frontier          # cost-quality sweep
 python -m harness.failure_injection # chaos scenarios
@@ -358,11 +358,12 @@ Full rationale, including the decisions that turned out wrong and why, is in
 |---|---|
 | [architecture.md](docs/architecture.md) | components, and how an event moves through them |
 | [tuning.md](docs/tuning.md) | every knob, what it controls, how to tell it is wrong |
+| [deployment.md](docs/deployment.md) | real machines: install, systemd, TLS, the GPU box, backup/restore |
 | [operations.md](docs/operations.md) | runbook: alerts, diagnosis, failure playbook |
 | [api.md](docs/api.md) | HTTP reference |
 | [training.md](docs/training.md) | fitting and deploying the learned scorer |
 | [extending.md](docs/extending.md) | adding sources, policies, providers, stores |
-| [docs/zh/](docs/zh/README.md) | 中文文档 |
+| [docs/zh/](docs/zh/README.md) | 中文文档（含[真机部署指南](docs/zh/deployment.md)） |
 
 ---
 
@@ -382,7 +383,8 @@ The experiment is worth exactly what its caveats allow.
 4. **Serving state is memory-bounded.** `restore()` reloads a capped window, not
    all history, and the read path is still in-process by design.
 5. **Single process.** Partitioning by `tenant_id`/`entity_id` is a design
-   intention, not running code.
+   intention, not running code — what does and does not scale today is stated
+   precisely in [deployment.md §10](docs/deployment.md#10-scaling-limits-read-before-adding-replicas).
 6. **Auth is off by default.** With `PULSEFEED_API_KEYS` set, the key decides
    the tenant and per-tenant rate limits apply; unset, every route is open dev
    mode — and `/readyz` says so, because an open internet-facing deployment
@@ -427,6 +429,7 @@ pulsefeed/
 │   ├── api.py           FastAPI (optional)
 │   ├── auth.py          API keys → tenants, per-tenant token buckets
 │   ├── ingest.py        bus-driven ingest worker (consume → ingest → ack)
+│   ├── preflight.py     pre-deploy checks: verifies whatever env config exists
 │   ├── llm/             provider ABC, mock, OpenAI-compatible, breaker, prompts
 │   ├── learning/        dataset + IPS weighting, logistic fit, calibration,
 │   │                    evaluation, collection, GPU encoder path
@@ -438,8 +441,10 @@ pulsefeed/
 │   ├── frontier.py          cost-quality sweep
 │   ├── train.py             fit + evaluate the cheap scorer
 │   └── failure_injection.py chaos scenarios
-├── tests/                   234 tests (16 need Redis/Postgres)
-├── docs/                    architecture, tuning, ops, API, training, zh/
+├── tests/                   245 tests (22 need Redis/Postgres)
+├── docs/                    architecture, tuning, deployment, ops, API, training, zh/
 ├── demo.py
+├── Dockerfile               non-root image; preflight runs at container start
+├── .env.example             every environment variable, documented
 └── DESIGN.md
 ```

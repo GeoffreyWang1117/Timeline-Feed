@@ -45,6 +45,7 @@ pulsefeed-replay = "harness.replay:main"
 pulsefeed-frontier = "harness.frontier:main"
 pulsefeed-chaos = "harness.failure_injection:main"
 pulsefeed-train = "harness.train:main"
+pulsefeed-preflight = "pulsefeed.preflight:main"
 
 [tool.setuptools]
 packages = [

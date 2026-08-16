@@ -627,6 +627,29 @@ in-flight batch back on the next loop. The bus-crash scenario caught it — 2,65
 events published, 5,146 ingested. Honouring idle time (and refusing to reclaim
 from yourself) fixed it to exactly 2,657.
 
+### The wiring that wasn't there
+
+One more entry for the honesty ledger. For two full development rounds after
+the storage layer landed, `create_app()` — the factory every deployment
+instruction pointed at — read the LLM key, the budgets, and the worker count
+from the environment, and silently ignored the backends. `docker compose up`
+next to `uvicorn` produced a system that *looked* durable and kept everything
+in process memory; the operations doc even described restore procedures the
+served process could never run. The storage layer was tested, documented, and
+unreachable from the deployment path.
+
+The fix (deployment round): `PULSEFEED_PG_DSN` and `PULSEFEED_REDIS_URL` wire
+the sink and bus into the factory, restore runs at boot, and two asymmetric
+failure policies apply. A configured-but-unreachable DSN **fails the boot** —
+the serving path stays fail-open (a database dying mid-flight must not stop
+the feed), but an operator who asked for durability at startup must not
+silently get amnesia instead. And with a bus configured, `POST /v1/events`
+answers 202 only after the event is in Redis, or 503 when it is not — the
+fail-closed publish the harness had always simulated, finally on the real
+path. `pulsefeed-preflight` exists for the same reason from the other side:
+every fallback in the system is silent by design, so deployment needed the one
+place where a configured-but-broken dependency fails loudly, before traffic.
+
 ---
 
 ## 9. Known limitations

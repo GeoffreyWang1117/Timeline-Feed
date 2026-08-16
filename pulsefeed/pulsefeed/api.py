@@ -23,6 +23,7 @@ the degradation so a dashboard can show it.
 from __future__ import annotations
 
 import os
+import socket
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,7 @@ except ImportError:  # pragma: no cover - optional dependency
 from .auth import ApiKeyRegistry, RateLimitConfig, TenantRateLimiter
 from .budget import TenantPlan
 from .clock import RealClock
+from .ingest import IngestConfig, IngestWorker
 from .llm.provider import (
     MockConfig,
     MockProvider,
@@ -159,11 +161,20 @@ if FASTAPI_AVAILABLE:
         registry: Optional[ApiKeyRegistry] = None,
         limiter: Optional[TenantRateLimiter] = None,
     ) -> "FastAPI":
+        own_pipeline = pipeline is None
         pipe = pipeline or create_pipeline()
         keys = registry if registry is not None else ApiKeyRegistry.from_env()
         rate = limiter if limiter is not None else TenantRateLimiter(
             RateLimitConfig.from_env()
         )
+
+        # Durable backends are wired from the environment only when this
+        # factory built the pipeline itself. A caller who passes a pipeline
+        # owns its sink and bus — tests rely on that, and so does anyone
+        # embedding PulseFeed with their own storage.
+        pg_dsn = os.environ.get("PULSEFEED_PG_DSN", "") if own_pipeline else ""
+        redis_url = os.environ.get("PULSEFEED_REDIS_URL", "") if own_pipeline else ""
+        durability: Dict[str, Any] = {"sink": None, "bus": None, "worker": None}
 
         def guard(request: "Request", kind: str, requested_tenant: Optional[str]) -> str:
             """Authenticate, resolve the effective tenant, and rate-limit.
@@ -192,11 +203,58 @@ if FASTAPI_AVAILABLE:
 
         @asynccontextmanager
         async def lifespan(app: "FastAPI"):
+            # Order on the way up: sink → restore → pipeline → bus consumer.
+            # The sink must exist before restore; restore must finish before
+            # serving (a half-restored feed would rank against missing entity
+            # memory); the bus consumer starts last so redeliveries land on a
+            # fully started pipeline. Shutdown runs the same order reversed.
+            if pg_dsn:
+                # Fail *closed* at startup, unlike the fail-open serving path:
+                # an operator who configured a DSN wants durability, and a boot
+                # that silently continues without it looks identical to a
+                # working deploy until the first restart loses everything.
+                from .store import PostgresSink
+
+                sink = PostgresSink(
+                    dsn=pg_dsn, embedding_dim=pipe.scorer.embedder.dim
+                )
+                await sink.connect()
+                pipe.sink = sink
+                durability["sink"] = sink
+                if os.environ.get("PULSEFEED_RESTORE", "1") != "0":
+                    tenants = os.environ.get(
+                        "PULSEFEED_RESTORE_TENANTS",
+                        os.environ.get("PULSEFEED_TENANT", "default"),
+                    )
+                    for tenant in filter(None, (t.strip() for t in tenants.split(","))):
+                        await pipe.restore(tenant)
             await pipe.start()
+            if redis_url:
+                from .store import RedisStreamBus
+
+                bus = RedisStreamBus(
+                    url=redis_url,
+                    stream=os.environ.get("PULSEFEED_STREAM", "pulsefeed:events"),
+                )
+                consumer = os.environ.get("PULSEFEED_CONSUMER") or (
+                    f"{socket.gethostname()}-{os.getpid()}"
+                )
+                worker = IngestWorker(
+                    bus, pipe, IngestConfig(consumer=consumer), clock=pipe.clock
+                )
+                await worker.start()
+                durability["bus"] = bus
+                durability["worker"] = worker
             try:
                 yield
             finally:
+                if durability["worker"] is not None:
+                    await durability["worker"].stop()
                 await pipe.stop(drain=True)
+                if durability["bus"] is not None:
+                    await durability["bus"].close()
+                if durability["sink"] is not None:
+                    await durability["sink"].close()
 
         app = FastAPI(
             title="PulseFeed",
@@ -206,13 +264,32 @@ if FASTAPI_AVAILABLE:
         )
         app.state.pipeline = pipe
 
+        async def accept(e: Event) -> None:
+            """Route an accepted event to the bus if one is configured.
+
+            With a bus, ``202`` means *durably* accepted: the event is in Redis
+            before we answer, and the in-process consumer ingests it with
+            at-least-once semantics. The bus fails **closed** — a lost raw
+            event is unrecoverable, so a bus outage is a 503 the producer can
+            retry against, never an accept-and-forget.
+            """
+            if durability["bus"] is not None:
+                try:
+                    await durability["bus"].publish(e)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503, detail="event bus unavailable"
+                    ) from exc
+            else:
+                await pipe.ingest(e)
+
         @app.post("/v1/events", status_code=202)
         async def ingest_event(event: EventIn, request: Request) -> Dict[str, str]:
             """Accept an event. Returns as soon as it is scored and routed —
             never waits on the LLM."""
             tenant = guard(request, "write", event.tenant_id)
             e = event.to_event(pipe.clock, tenant)
-            await pipe.ingest(e)
+            await accept(e)
             return {"event_id": e.event_id, "status": "accepted"}
 
         @app.post("/v1/events:batch", status_code=202)
@@ -227,7 +304,7 @@ if FASTAPI_AVAILABLE:
                 # must not be a way around the per-event rate.
                 tenant = guard(request, "write", event.tenant_id)
                 e = event.to_event(pipe.clock, tenant)
-                await pipe.ingest(e)
+                await accept(e)
                 ids.append(e.event_id)
             return {"accepted": len(ids), "event_ids": ids}
 
@@ -340,6 +417,21 @@ if FASTAPI_AVAILABLE:
         async def readyz() -> Dict[str, Any]:
             healthy = pipe.provider.primary_healthy
             model = getattr(pipe.scorer, "model", None)
+            # Durability state mirrors auth state: "memory" here on a box that
+            # was supposed to be durable is a misconfiguration that would
+            # otherwise be invisible until the first restart lost everything.
+            durable: Dict[str, Any] = {
+                "sink": "postgres" if durability["sink"] is not None else "memory",
+                "bus": "redis" if durability["bus"] is not None else "none",
+                "sink_failures": pipe.sink_failures,
+            }
+            worker = durability["worker"]
+            if worker is not None:
+                try:
+                    durable["bus_lag"] = await worker.lag()
+                except Exception:
+                    durable["bus_lag"] = "unavailable"
+                durable["ingest"] = dict(worker.stats)
             return {
                 "status": "ok",
                 "enrichment": "healthy" if healthy else "degraded",
@@ -357,6 +449,7 @@ if FASTAPI_AVAILABLE:
                 # Making it visible here is the difference.
                 "auth": "enabled" if keys.enabled else "disabled (dev mode)",
                 "rate_limit_denials": rate.denials,
+                "durability": durable,
                 "prometheus": PROMETHEUS_AVAILABLE,
             }
 

@@ -4,12 +4,13 @@
 |---|---|
 | [architecture.md](architecture.md) | you want to know what the components are and how an event moves through them |
 | [tuning.md](tuning.md) | you are changing a threshold, a window, a budget, or a queue size |
+| [deployment.md](deployment.md) | you are putting this on real machines — install, systemd, TLS, GPU box, backup |
 | [operations.md](operations.md) | you are running this, and something is wrong |
 | [api.md](api.md) | you are calling the HTTP API |
 | [training.md](training.md) | you are fitting or deploying the learned scorer |
 | [extending.md](extending.md) | you are adding a source, a policy, a provider, or a store |
 | [../DESIGN.md](../DESIGN.md) | you want to know *why* it is built this way, including what went wrong |
-| [zh/README.md](zh/README.md) | 中文文档 |
+| [zh/README.md](zh/README.md) | 中文文档（含 [真机部署指南](zh/deployment.md)） |
 
 ## The one-paragraph version
 
