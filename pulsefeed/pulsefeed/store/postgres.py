@@ -392,26 +392,94 @@ class PostgresSink(PersistenceSink):
                 tenant_id,
                 entity_id,
             )
-        return [
-            Summary(
-                summary_id=row["summary_id"],
-                tenant_id=row["tenant_id"],
-                level=SummaryLevel(row["level"]),
-                text=row["body"],
-                source_event_ids=list(row["source_event_ids"] or []),
-                entity_ids=list(row["entity_ids"] or []),
-                child_summary_ids=list(row["child_summary_ids"] or []),
-                severity=Severity(row["severity"] or "unknown"),
-                confidence=row["confidence"] or 0.0,
-                model=row["model"] or "unknown",
-                version=row["version"] or 1,
-                generated_at=row["generated_at"] or 0.0,
-                status=SummaryStatus(row["status"] or "active"),
-                supersedes=row["supersedes"],
-                superseded_by=row["superseded_by"],
+        return [self._row_to_summary(row) for row in rows]
+
+    async def load_annotations(
+        self, tenant_id: str, limit: int = 1000
+    ) -> List[SemanticAnnotation]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM pf_annotations WHERE tenant_id = $1 "
+                "ORDER BY generated_at DESC LIMIT $2",
+                tenant_id,
+                limit,
             )
-            for row in rows
-        ]
+        return [self._row_to_annotation(row) for row in rows]
+
+    async def load_summaries(
+        self, tenant_id: str, limit: int = 1000, active_only: bool = True
+    ) -> List[Summary]:
+        query = "SELECT * FROM pf_summaries WHERE tenant_id = $1"
+        if active_only:
+            query += " AND status = 'active'"
+        query += " ORDER BY generated_at DESC LIMIT $2"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(query, tenant_id, limit)
+        return [self._row_to_summary(row) for row in rows]
+
+    async def load_entities(
+        self, tenant_id: str, limit: int = 10_000
+    ) -> List[EntityMemory]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM pf_entity_memory WHERE tenant_id = $1 "
+                "ORDER BY last_update DESC NULLS LAST LIMIT $2",
+                tenant_id,
+                limit,
+            )
+        restored = []
+        for row in rows:
+            memory = EntityMemory(
+                entity_id=row["entity_id"],
+                tenant_id=row["tenant_id"],
+                kind=row["kind"] or "unknown",
+                current_state=row["current_state"] or "unknown",
+                recent_summary=row["recent_summary"] or "",
+                severity=Severity(row["severity"] or "unknown"),
+                event_count=row["event_count"] or 0,
+                last_update=row["last_update"] or 0.0,
+            )
+            restored.append(memory)
+        return restored
+
+    def _row_to_annotation(self, row) -> SemanticAnnotation:
+        return SemanticAnnotation(
+            annotation_id=row["annotation_id"],
+            tenant_id=row["tenant_id"],
+            summary=row["summary"],
+            source_event_ids=list(row["source_event_ids"] or []),
+            category=row["category"] or "unknown",
+            severity=Severity(row["severity"] or "unknown"),
+            entities=list(row["entities"] or []),
+            actionability=row["actionability"] or "none",
+            causal_links=list(row["causal_links"] or []),
+            confidence=row["confidence"] or 0.0,
+            model=row["model"] or "unknown",
+            provider=row["provider"] or "unknown",
+            generated_at=row["generated_at"] or 0.0,
+            tokens_used=row["tokens_used"] or 0,
+            cost_usd=row["cost_usd"] or 0.0,
+            degraded=bool(row["degraded"]),
+        )
+
+    def _row_to_summary(self, row) -> Summary:
+        return Summary(
+            summary_id=row["summary_id"],
+            tenant_id=row["tenant_id"],
+            level=SummaryLevel(row["level"]),
+            text=row["body"],
+            source_event_ids=list(row["source_event_ids"] or []),
+            entity_ids=list(row["entity_ids"] or []),
+            child_summary_ids=list(row["child_summary_ids"] or []),
+            severity=Severity(row["severity"] or "unknown"),
+            confidence=row["confidence"] or 0.0,
+            model=row["model"] or "unknown",
+            version=row["version"] or 1,
+            generated_at=row["generated_at"] or 0.0,
+            status=SummaryStatus(row["status"] or "active"),
+            supersedes=row["supersedes"],
+            superseded_by=row["superseded_by"],
+        )
 
     async def health(self) -> Dict[str, Any]:
         try:

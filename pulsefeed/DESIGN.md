@@ -279,6 +279,34 @@ all. Each pass now rebuilds the episode over the full window and supersedes the
 previous version, so the story grows in place. A signature check means an
 unchanged episode is never re-narrated, so a quiet tick costs nothing.
 
+### Letting cheap events into the story
+
+Episodes were built only from LLM-written cluster summaries, so an event that
+never earned a call could not be part of the story it belonged to. In the demo
+that meant "deployment #813 completed" — lexically boring, causally central —
+sat as its own row *outside* the incident episode about rolling back deployment
+#813.
+
+A cheap cluster now emits a MICRO summary, and so becomes eligible for rollup,
+**only if its entity already has an open episode.** The rule is narrow on
+purpose: emitting one for every cheap cluster would put the whole firehose into
+the candidate set and turn episodes into digests of noise. "This entity is in
+the middle of a story" is the cheapest available evidence that an otherwise-dull
+event belongs in it.
+
+Measured effect on the standard trace: rows to reach 80% important-event recall
+fell from 19 to **9**, R@10 rose 76.3% → 84.2%, at a cost of three extra LLM
+calls (48 → 51).
+
+This also exposed a bug in the *metric*. `enriched_important_coverage` was
+computed over the visible feed, so absorbing enriched rows behind an episode
+made real coverage rise from 60.5% to 65.8% while the measurement *fell* to
+47.4% — the enrichment had merely been tidied away under a parent. Coverage is
+now measured over the expanded feed. Summarising well should not score as losing
+enrichment.
+
+### Supersede
+
 And when the system was **wrong** — 12:05 "suspected database issue", 12:25
 "root cause confirmed: DNS" — the old summary is not overwritten. It is marked
 `SUPERSEDED`, linked to its replacement, and kept. The correction inherits the
@@ -504,6 +532,27 @@ unrecoverable), the sink fails **open** (keep serving, count the failure — a
 delayed write is recoverable, and putting a database on the read path of a feed
 whose entire premise is surviving its dependencies would be self-defeating).
 
+### Reading it back
+
+A durable record nobody reads back is a backup, not a database. `restore()`
+rebuilds serving state after a restart, and *what it declines to restore* is
+the interesting half:
+
+- **Raw events** — restored, so a restored summary can still expand into the
+  facts it cites. A row whose evidence 404s is worse than no row.
+- **Entity memory** — restored, so the first event about a service that was
+  degraded five minutes ago is not ranked as though nothing had happened to it.
+- **Active summaries** → timeline rows. **Superseded ones are not restored.**
+  They stay on disk for the audit trail; resurrecting them would put retracted
+  conclusions back in front of users.
+- **Open coalescing clusters** — deliberately not restored. They were in-flight
+  working state rather than a record, and the events inside them are durable in
+  the bus and will be redelivered if never acknowledged.
+
+Restored rows are ranked from severity and confidence alone, because the cheap
+features that produced the original score were never persisted and inventing
+them would be worse than ranking conservatively.
+
 The in-memory implementations model the same semantics on purpose, so bugs
 surface in tests. That paid off immediately and embarrassingly: the in-memory
 bus ignored `min_idle_ms` in `reclaim_stale` and handed a consumer its own
@@ -539,24 +588,18 @@ Stated plainly, because the experiment is only worth what its caveats allow.
    second-order — it comes from *packing*, not from better judgement about what
    matters.
 
-   The coverage curve is also not clean: enriched coverage peaks at θ=0.15
-   (68.4%) rather than at the cheapest threshold (63.2% at θ=0.05), and
-   storyline coverage is non-monotonic (60% at θ=0.05, 100% at θ=0.35). With 38
-   important events and 5 storylines the sample is far too small for those
-   wiggles to mean anything. Treat the curve's *shape* — a 9x spend range with
-   marginal returns falling roughly 6x from the cheap end — as the finding, not
-   any individual point.
+   The coverage curve looked non-monotonic for a while — peaking at θ=0.15
+   rather than at the cheapest threshold — and that turned out to be the metric
+   bug described in §7, not a property of the system. Measured over the expanded
+   feed the curve is clean: an 8x spend range, 17 calls / 28.9% coverage up to
+   137 calls / 97.4%, with marginal returns falling roughly 3x. Treat the shape
+   as the finding; with 38 important events across 5 storylines, individual
+   points are still noisy.
 
-4. **Episodes are built from cluster summaries, so cheap-path events do not join
-   them.** In the demo, "deployment #813 completed" is causally central but
-   appears as its own item rather than inside the incident episode, because it
-   never earned an LLM call. Including cheap items in rollups is the obvious
-   next step.
-
-5. **Ranking trails at K=20.** 81.6% against LLM-everything's 94.7%, with
-   precision@20 of 60% against 95%. Diagnosed in §8a. The learned scorer (§8c)
-   is the intended fix and does not yet deliver it on ground-truth labels; it
-   does improve calibration substantially and wins on teacher labels.
+4. **Ranking trails at K=20.** 84.2% against LLM-everything's 94.7%. Diagnosed
+   in §8a. The learned scorer (§8c) is the intended fix and does not yet deliver
+   it on ground-truth labels; it does improve calibration substantially and wins
+   on teacher labels.
 
 5a. **The learned scorer has never seen real traffic or a GPU.** Everything in
    §8c was fitted on synthetic traces. The transformer path is written and
@@ -569,14 +612,17 @@ Stated plainly, because the experiment is only worth what its caveats allow.
    fitted model at once. Worth doing deliberately, with a migration, rather than
    as a drive-by.
 
-6. **Persistence is write-through, not read-through.** The bus and sink are
-   implemented and tested against real Redis and Postgres+pgvector, but the
-   in-memory structures are still the serving path and nothing reloads them on
-   restart. Durable ingestion and a durable record exist; durable *serving* does
-   not.
+6. **Serving state is memory-bounded.** `restore()` rebuilds events, entity
+   memory and active summaries after a restart, but from a capped window rather
+   than all history, and the read path remains in-process by design.
 
 7. **Single-process.** Horizontal scaling by `tenant_id`/`entity_id` partition is
    a design intention, not running code.
+
+8. **No authentication.** `tenant_id` is taken from the request body. Tenant
+   *isolation* is enforced everywhere it could leak — timeline reads, entity
+   keys, vector search, annotation citations — but nothing verifies the caller
+   is who they claim to be.
 
 ---
 

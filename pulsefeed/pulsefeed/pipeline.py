@@ -104,6 +104,7 @@ class PipelineStats:
     supersedes: int = 0
     episodes_built: int = 0
     episodes_enriched: int = 0
+    micro_summaries: int = 0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -201,11 +202,116 @@ class PulseFeedPipeline:
         ]
         self._ticker = asyncio.create_task(self._tick_loop(), name="pulsefeed-ticker")
 
+    async def restore(
+        self,
+        tenant_id: str,
+        *,
+        event_limit: int = 5_000,
+        summary_limit: int = 1_000,
+    ) -> Dict[str, int]:
+        """Rebuild serving state from the durable record after a restart.
+
+        Without this the durability story stops halfway: events and conclusions
+        survive a restart on disk, but the process wakes up with an empty
+        timeline and an entity store that has forgotten every incident, so the
+        first event about a service that was degraded five minutes ago is ranked
+        as though nothing had ever happened to it.
+
+        What is restored, and what deliberately is not:
+
+        * **Raw events** — needed so ``evidence_for`` can still expand a
+          restored summary back into the facts it cites. A restored item whose
+          evidence 404s is worse than no item.
+        * **Entity memory** — the state that makes ranking and prompting aware
+          of what is currently on fire.
+        * **Active summaries** → timeline items. Superseded ones stay on disk
+          for the audit trail; resurrecting them would put retracted
+          conclusions back in front of users.
+        * **Open coalescing clusters are *not* restored.** They were in-flight
+          working state, not a record; the events inside them are durable in the
+          bus and will be redelivered if they were never acknowledged.
+
+        Restored items are marked so the feed can distinguish "this is what we
+        concluded before the restart" from "this is live".
+        """
+        counts = {"events": 0, "entities": 0, "summaries": 0, "items": 0}
+
+        for event in await self.sink.load_events(tenant_id, event_limit):
+            self.events[event.event_id] = event
+            counts["events"] += 1
+
+        for memory in await self.sink.load_entities(tenant_id):
+            self.entities._store[(tenant_id, memory.entity_id)] = memory
+            counts["entities"] += 1
+
+        summaries = await self.sink.load_summaries(
+            tenant_id, summary_limit, active_only=True
+        )
+        # Oldest first, so episodes rebuilt on top of clusters see their
+        # children in the order they were originally produced.
+        for summary in sorted(summaries, key=lambda s: s.generated_at):
+            self.summaries.add(summary)
+            counts["summaries"] += 1
+            if self._publish_restored_item(summary):
+                counts["items"] += 1
+
+        return counts
+
+    def _publish_restored_item(self, summary: Summary) -> bool:
+        """Turn a restored summary into a timeline row.
+
+        Only leaf levels become rows directly. An episode's children are already
+        represented by the episode, so publishing both would show the same
+        happening twice — the same reason ``_attach_children`` hides them during
+        normal operation.
+        """
+        if summary.level not in (SummaryLevel.CLUSTER, SummaryLevel.EPISODE):
+            return False
+
+        item = TimelineItem(
+            item_id=new_id("itm"),
+            tenant_id=summary.tenant_id,
+            title=summary.text,
+            timestamp=summary.generated_at,
+            rank_score=0.0,
+            base_rank=0.0,
+            source_event_ids=list(summary.source_event_ids),
+            kind="episode" if summary.level is SummaryLevel.EPISODE else "cluster",
+            severity=summary.severity,
+            enriched=summary.model not in ("extractive", "extractive-fallback", "cheap"),
+            event_count=len(summary.source_event_ids),
+            entity_ids=list(summary.entity_ids),
+        )
+        # Rank from severity and confidence alone: the cheap features that
+        # produced the original score were never persisted, and inventing them
+        # would be worse than ranking a restored row conservatively.
+        item.base_rank = min(
+            1.0, 0.6 * (summary.severity.rank / 4.0) + 0.2 * summary.confidence
+        )
+        item.rank_score = item.base_rank
+
+        self._timeline.setdefault(summary.tenant_id, {})[item.item_id] = item
+        self._item_by_summary[summary.summary_id] = item
+
+        # Hide any restored children behind their restored parent.
+        for child_id in summary.child_summary_ids:
+            child_item = self._item_by_summary.get(child_id)
+            if child_item is not None:
+                child_item.rolled_up_into = item.item_id
+        return True
+
     async def flush(self) -> None:
         """Close every open cluster and push it through the trigger.
 
         Separate from ``stop`` so a simulated-time replay can flush, let its
         clock driver run the queue to empty, and only then shut down.
+
+        **Under a ``VirtualClock`` this must run as a task alongside the clock
+        driver, not before it.** Flushing can await the provider (episode
+        narration goes through the LLM), and a provider call parks on a virtual
+        timer that only the driver fires — so awaiting ``flush()`` outside the
+        driver's lifetime deadlocks. Every caller in the harness and the tests
+        runs it inside the feeder task for this reason.
         """
         for cluster in self.coalescer.flush(self.clock.now()):
             await self._handle_cluster(cluster)
@@ -423,6 +529,48 @@ class PulseFeedPipeline:
         self.metrics.events_skipped.labels(cluster.tenant_id, reason).inc()
         for event in cluster.events:
             self._path_by_event.setdefault(event.event_id, PathTaken.CHEAP)
+        self._maybe_join_open_episode(cluster)
+
+    def _maybe_join_open_episode(self, cluster: EventCluster) -> None:
+        """Let a cheap cluster join its entity's episode, if one is open.
+
+        Episodes were previously built only from LLM-written cluster summaries,
+        so an event that never earned a call could not be part of the story it
+        belonged to. In the demo that meant "deployment #813 completed" —
+        lexically boring, causally central — sat as its own row *outside* the
+        incident episode that was about the rollback of deployment #813.
+
+        The rule is narrow on purpose: only clusters on an entity that already
+        has an **open episode** qualify. Emitting a micro summary for every
+        cheap cluster would put the whole firehose into the rollup candidate set
+        and turn episodes into digests of noise. "This entity is currently in
+        the middle of a story" is the cheapest available evidence that an
+        otherwise-dull event is worth including.
+        """
+        key = (cluster.tenant_id, cluster.entity_id)
+        if key not in self._open_episodes:
+            return
+        if cluster.cluster_id in self._cluster_summary:
+            return
+
+        summary = Summary(
+            summary_id=new_id("sum"),
+            tenant_id=cluster.tenant_id,
+            level=SummaryLevel.MICRO,
+            text=describe_cluster(cluster),
+            source_event_ids=cluster.event_ids,
+            entity_ids=[cluster.entity_id],
+            severity=self._cheap_severity(cluster.features.risk),
+            confidence=0.4,  # a description, not a conclusion
+            model="cheap",
+            generated_at=cluster.closed_at,
+        )
+        self.summaries.add(summary)
+        self._cluster_summary[cluster.cluster_id] = summary
+        item = self._item_by_cluster.get(cluster.cluster_id)
+        if item is not None:
+            self._item_by_summary[summary.summary_id] = item
+        self.stats.micro_summaries += 1
 
     def _record_drop(self, cluster: EventCluster, reason: str) -> None:
         self.stats.dropped += 1
@@ -618,9 +766,12 @@ class PulseFeedPipeline:
         nothing.
         """
         by_entity: Dict[str, List[Summary]] = {}
-        for summary in self.summaries.active(SummaryLevel.CLUSTER, tenant_id):
-            entity = summary.entity_ids[0] if summary.entity_ids else "__none__"
-            by_entity.setdefault(entity, []).append(summary)
+        # MICRO as well as CLUSTER: micro summaries are the cheap-path events
+        # that joined an open episode (see ``_maybe_join_open_episode``).
+        for level in (SummaryLevel.CLUSTER, SummaryLevel.MICRO):
+            for summary in self.summaries.active(level, tenant_id):
+                entity = summary.entity_ids[0] if summary.entity_ids else "__none__"
+                by_entity.setdefault(entity, []).append(summary)
 
         built: List[Summary] = []
         window = self.rollup.config.episode_window_seconds

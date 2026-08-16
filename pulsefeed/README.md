@@ -54,12 +54,12 @@ Nothing is hardcoded; re-running reproduces them.
 
 ### Cost vs quality
 
-| arm | LLM calls | tokens | cost | recall@20 | prec@20 | enriched cov | storylines | items |
-|---|---|---|---|---|---|---|---|---|
-| A. Chronological | 0 | 0 | $0.0000 | 7.9% | 15% | 0% | 0% | 6,396 |
-| B. Rule + embedding | 0 | 0 | $0.0000 | 52.6% | 100% | 0% | 0% | 1,730 |
-| C. LLM-everything | 4,905 | 2,218,794 | $3.3282 | **94.7%** | 95% | 65.8% | 100% | 4,603 |
-| **D. PulseFeed** | **48** | **28,317** | **$0.0425** | 81.6% | 60% | 60.5% | 80% | 1,712 |
+| arm | LLM calls | cost | recall@20 | enriched cov | storylines | items |
+|---|---|---|---|---|---|---|
+| A. Chronological | 0 | $0.0000 | 7.9% | 0% | 0% | 6,396 |
+| B. Rule + embedding | 0 | $0.0000 | 52.6% | 0% | 0% | 1,730 |
+| C. LLM-everything | 4,905 | $3.3282 | **94.7%** | 100% | 100% | 4,603 |
+| **D. PulseFeed** | **51** | **$0.0548** | 84.2% | 65.8% | 80% | 1,603 |
 
 ### Recall as the page grows, and the scroll depth it costs
 
@@ -67,8 +67,8 @@ Nothing is hardcoded; re-running reproduces them.
 |---|---|---|---|---|---|---|
 | A. Chronological | 7.9% | 7.9% | 10.5% | 3,159 | 4,903 | 6,150 |
 | B. Rule + embedding | 26.3% | 52.6% | 92.1% | 19 | 47 | 63 |
-| C. LLM-everything | 44.7% | 94.7% | 94.7% | 12 | 20 | 419 |
-| **D. PulseFeed** | **76.3%** | 81.6% | **97.4%** | **2** | **19** | **35** |
+| C. LLM-everything | 44.7% | **94.7%** | 94.7% | 12 | 20 | 419 |
+| **D. PulseFeed** | **84.2%** | 84.2% | **97.4%** | **3** | **9** | **31** |
 
 ### System behaviour under the same load
 
@@ -81,55 +81,53 @@ Nothing is hardcoded; re-running reproduces them.
 
 **Reading these honestly:**
 
-- **99.0% fewer LLM calls than enriching everything (48 vs 4,905), at 1.3% of
+- **99.0% fewer LLM calls than enriching everything (51 vs 4,905), at 1.6% of
   the cost.**
-- **PulseFeed dominates on scroll depth.** Two items to reach half the important
-  events (C needs 12, B needs 19); 35 to reach 95% where C needs **419**. One
-  episode row carries a whole incident instead of spending twenty rows on it.
-- **LLM-everything wins recall@20 (94.7% vs 81.6%).** That is a real loss, not a
-  metric artifact: between ranks 8 and 23 PulseFeed's feed contains items that
-  should have been displaced. K=20 is the one slice where spreading events
-  thinly across rows pays, and C buys it at 102x the calls with a queue that
-  collapses.
+- **PulseFeed dominates on scroll depth.** Three rows to reach half the important
+  events, **9 to reach 80%** (C needs 20, B needs 47), 31 to reach 95% where C
+  needs **419**. One episode row carries a whole incident instead of spending
+  twenty rows on it.
+- **LLM-everything still wins recall@20 (94.7% vs 84.2%).** A real loss, not a
+  metric artifact: PulseFeed's ranking has relevant rows at the top and then a
+  gap. K=20 is the slice where spreading events thinly across rows pays, and C
+  buys it at 96x the calls with a queue that collapses.
 - **LLM-everything cannot keep up.** 1,748 items queued, p99 wait 74s, and 1,500
   shed as stale before ever being served. PulseFeed's queue peaks at 2.
-- **precision@20 60% vs 95%** — same cause as the recall@20 gap; the ranker still
-  has room.
 - **PulseFeed covers 80% of planted storylines against 100%.** Admission control
   does miss things. That is the trade, measured rather than asserted.
 - **With no LLM at all** (arm B — exactly what happens when the provider is
   down) the feed still reaches 52.6% recall@20 and 100% total coverage, and it
-  is the *same* 1,730-item feed shape, just without prose.
+  is the *same* 1,730-row feed shape, just without prose.
 
 ### Cost–quality frontier
 
 `python -m harness.frontier` sweeps the utility threshold from 0.05 to 0.95 on
 one fixed trace, holding every other component constant.
 
-| θ | LLM calls | cost | enriched cov | cov/call | recall@20 |
-|---|---|---|---|---|---|
-| 0.05 | 133 | $0.1031 | 63.2% | 0.47% | 97.4% |
-| 0.15 | 83 | $0.0658 | 68.4% | 0.82% | 86.8% |
-| 0.25 | 52 | $0.0417 | 60.5% | 1.16% | 81.6% |
-| 0.35 | 34 | $0.0291 | 60.5% | 1.78% | 81.6% |
-| 0.55 | 28 | $0.0238 | 50.0% | 1.79% | 79.0% |
-| 0.75 | 15 | $0.0119 | 28.9% | 1.93% | 65.8% |
-| 0.95 | 15 | $0.0119 | 28.9% | 1.93% | 65.8% |
+| θ | LLM calls | cost | enriched cov | storylines | cov/call | recall@20 |
+|---|---|---|---|---|---|---|
+| 0.05 | 137 | $0.1186 | 97.4% | 100% | 0.71% | 92.1% |
+| 0.15 | 85 | $0.0738 | 81.6% | 100% | 0.96% | 89.5% |
+| 0.25 | 54 | $0.0505 | 81.6% | 100% | 1.51% | 89.5% |
+| 0.35 | 36 | $0.0380 | 71.0% | 100% | 1.97% | 81.6% |
+| 0.55 | 32 | $0.0350 | 68.4% | 80% | 2.14% | 81.6% |
+| 0.75 | 17 | $0.0139 | 28.9% | 80% | 1.70% | 65.8% |
+| 0.95 | 17 | $0.0139 | 28.9% | 80% | 1.70% | 65.8% |
 
-- The threshold is a **9x spend dial** on one unchanged trace, and marginal
-  returns fall about 6x from the cheap end (1.93% coverage per call) to the
-  expensive one (0.29% for the marginal call between the extremes).
-- **Even at θ=0.95 — admit essentially nothing — 15 calls still happen.** Those
+- The threshold is an **8x spend dial** on one unchanged trace, now cleanly
+  monotonic — the non-monotonicity in an earlier version of this table was the
+  coverage-metric bug described below, not a property of the system.
+- **Marginal returns fall about 3x.** The average call at the cheap end buys
+  1.70% coverage; the marginal call between the extremes buys 0.57%.
+- **Even at θ=0.95 — admit essentially nothing — 17 calls still happen.** Those
   are the hard safety-rule bypasses. Critical events are never subject to the
   budget dial.
-- **recall@20 does move with θ** (65.8% → 97.4%), but only because episodes are
-  built from LLM-produced cluster summaries and episodes pack many events into
-  one row. The gain is *packing*, not better judgement about what matters.
-- **The curve is noisy and not monotonic.** Coverage peaks at θ=0.15 rather than
-  at the cheapest threshold; storyline coverage wanders between 60% and 100%.
-  With 38 important events across 5 storylines the sample is far too small for
-  those wiggles to mean anything — the *shape* is the finding, not any point on
-  it.
+- **At θ=0.05 the system reaches 97.4% enriched coverage and 100% of
+  storylines** for $0.12 — still 36x cheaper than enriching everything, which
+  reached 100%/100% for $3.33. The dial spans the whole useful range.
+- **recall@20 moves with θ** (65.8% → 92.1%), but the mechanism is *packing* —
+  episodes are built from LLM-produced summaries and pack many events into one
+  row — not better judgement about what matters.
 
 ---
 
@@ -246,7 +244,7 @@ runs on the standard library.
 cd pulsefeed
 
 python demo.py                      # the worked example, annotated
-python -m pytest tests/ -q          # 178 tests
+python -m pytest tests/ -q          # 203 tests
 python -m harness.replay            # the A/B/C/D experiment
 python -m harness.frontier          # cost-quality sweep
 python -m harness.failure_injection # chaos scenarios
@@ -348,10 +346,23 @@ at-least-once delivery, explicit acks and reclaim of work abandoned by dead
 consumers; a `PersistenceSink` (Postgres, with pgvector when present) is the
 durable record. The bus fails *closed* — buffer and replay, because a lost raw
 event is unrecoverable. The sink fails *open* — keep serving and count the
-failure, because a delayed write is not.
+failure, because a delayed write is not. `restore()` rebuilds serving state
+after a restart: events, entity memory, and *active* summaries. Superseded
+beliefs stay on disk for the audit trail rather than being resurrected.
 
 Full rationale, including the decisions that turned out wrong and why, is in
-**[DESIGN.md](DESIGN.md)**.
+**[DESIGN.md](DESIGN.md)**. Operational and reference documentation lives in
+**[docs/](docs/README.md)**:
+
+| | |
+|---|---|
+| [architecture.md](docs/architecture.md) | components, and how an event moves through them |
+| [tuning.md](docs/tuning.md) | every knob, what it controls, how to tell it is wrong |
+| [operations.md](docs/operations.md) | runbook: alerts, diagnosis, failure playbook |
+| [api.md](docs/api.md) | HTTP reference |
+| [training.md](docs/training.md) | fitting and deploying the learned scorer |
+| [extending.md](docs/extending.md) | adding sources, policies, providers, stores |
+| [docs/zh/](docs/zh/README.md) | 中文文档 |
 
 ---
 
@@ -366,17 +377,14 @@ The experiment is worth exactly what its caveats allow.
    clusters and entity memory, so the LLM arms' advantage is structural rather
    than rigged, but its prose is mechanical and it cannot be wrong in the
    interesting ways a real model can. **Nothing here measures summary quality.**
-3. **Episodes are built from cluster summaries**, so cheap-path events do not
-   join them — in the demo, "deployment #813 completed" is causally central but
-   sits outside the incident episode.
-4. **Precision@20 is worse than LLM-everything's.** The ranker has room.
-5. **Serving is still in-process.** Redis Streams and Postgres/pgvector are now
-   implemented and tested against real servers, but persistence is
-   *write-through*: the in-memory structures remain the read path, and nothing
-   reloads them on restart. Durable ingestion and a durable record exist;
-   durable *serving* does not.
-6. **Single process.** Partitioning by `tenant_id`/`entity_id` is a design
+3. **Ranking trails LLM-everything at K=20** (84.2% vs 94.7%). Relevant rows
+   cluster at the top and then there is a gap. Diagnosed, not fixed.
+4. **Serving state is memory-bounded.** `restore()` reloads a capped window, not
+   all history, and the read path is still in-process by design.
+5. **Single process.** Partitioning by `tenant_id`/`entity_id` is a design
    intention, not running code.
+6. **No authentication.** `tenant_id` comes from the request body; anything
+   internet-facing needs an auth layer in front.
 
 ---
 
@@ -427,7 +435,8 @@ pulsefeed/
 │   ├── frontier.py          cost-quality sweep
 │   ├── train.py             fit + evaluate the cheap scorer
 │   └── failure_injection.py chaos scenarios
-├── tests/                   178 tests (+14 needing Redis/Postgres)
+├── tests/                   203 tests (14 need Redis/Postgres)
+├── docs/                    architecture, tuning, ops, API, training, zh/
 ├── demo.py
 └── DESIGN.md
 ```

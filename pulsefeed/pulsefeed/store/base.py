@@ -117,6 +117,35 @@ class PersistenceSink(ABC):
     async def entity_history(self, tenant_id: str, entity_id: str) -> List[Summary]:
         """Every belief ever held about an entity, superseded ones included."""
 
+    # -- restart recovery --------------------------------------------------
+    #
+    # A durable record nobody reads back is a backup, not a database. These
+    # three exist so a restarted process can rebuild its serving state instead
+    # of waking up with an empty feed and a full disk.
+
+    @abstractmethod
+    async def load_annotations(
+        self, tenant_id: str, limit: int = 1000
+    ) -> List[SemanticAnnotation]:
+        """Most recent annotations first."""
+
+    @abstractmethod
+    async def load_summaries(
+        self, tenant_id: str, limit: int = 1000, active_only: bool = True
+    ) -> List[Summary]:
+        """Most recent summaries first.
+
+        ``active_only`` because restoring superseded beliefs into the live feed
+        would resurrect conclusions the system has already retracted. They stay
+        on disk for the audit trail; they do not come back as timeline rows.
+        """
+
+    @abstractmethod
+    async def load_entities(
+        self, tenant_id: str, limit: int = 10_000
+    ) -> List[EntityMemory]:
+        """Entity state, most recently updated first."""
+
     async def health(self) -> Dict[str, Any]:
         return {"healthy": True}
 
@@ -146,4 +175,14 @@ class NullSink(PersistenceSink):
         return []
 
     async def entity_history(self, tenant_id: str, entity_id: str) -> List[Summary]:
+        return []
+
+    async def load_annotations(self, tenant_id: str, limit: int = 1000):
+        return []
+
+    async def load_summaries(self, tenant_id: str, limit: int = 1000,
+                             active_only: bool = True):
+        return []
+
+    async def load_entities(self, tenant_id: str, limit: int = 10_000):
         return []

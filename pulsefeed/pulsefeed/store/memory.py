@@ -20,7 +20,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..embedding import cosine
 from ..memory import EntityMemory
-from ..models import Event, EventFeatures, SemanticAnnotation, Summary
+from ..models import (
+    Event,
+    EventFeatures,
+    SemanticAnnotation,
+    Summary,
+    SummaryStatus,
+)
 from .base import DeliveredEvent, EventBus, PersistenceSink
 
 
@@ -195,3 +201,30 @@ class InMemorySink(PersistenceSink):
             ),
             key=lambda s: s.generated_at,
         )
+
+    async def load_annotations(
+        self, tenant_id: str, limit: int = 1000
+    ) -> List[SemanticAnnotation]:
+        matching = [
+            a for a in self.annotations.values() if a.tenant_id == tenant_id
+        ]
+        return sorted(matching, key=lambda a: -a.generated_at)[:limit]
+
+    async def load_summaries(
+        self, tenant_id: str, limit: int = 1000, active_only: bool = True
+    ) -> List[Summary]:
+        matching = [
+            s
+            for s in self.summaries.values()
+            if s.tenant_id == tenant_id
+            and (not active_only or s.status is SummaryStatus.ACTIVE)
+        ]
+        return sorted(matching, key=lambda s: -s.generated_at)[:limit]
+
+    async def load_entities(
+        self, tenant_id: str, limit: int = 10_000
+    ) -> List[EntityMemory]:
+        matching = [
+            m for (t, _), m in self.entities.items() if t == tenant_id
+        ]
+        return sorted(matching, key=lambda m: -m.last_update)[:limit]

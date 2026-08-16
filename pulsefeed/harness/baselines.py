@@ -347,9 +347,24 @@ def evaluate(
     for target in targets:
         result.items_to_recall[target] = None  # never reached
 
+    # Enrichment coverage is measured over the *expanded* feed — including rows
+    # that have been rolled up behind an episode. Those rows still exist, are
+    # still reachable by expanding the episode, and are still model-written;
+    # scoring them as lost would penalise the system for summarising well.
+    #
+    # This was a live bug in the metric rather than a hypothetical: absorbing
+    # cheap events into episodes improved real coverage from 60.5% to 65.8%
+    # while the visible-only measurement *fell* to 47.4%, purely because more
+    # enriched rows had been tidied away under a parent.
+    #
+    # recall@K stays on the default (collapsed) feed, because that is what a
+    # reader actually scrolls.
+    expanded_items = pipeline.timeline(
+        tenant_id, limit=10 ** 9, ranked=spec.ranked, expand_rolled_up=True
+    )
     all_covered = set()
     enriched_covered_all = set()
-    for item in all_items:
+    for item in expanded_items:
         all_covered.update(item.source_event_ids)
         if item.enriched:
             enriched_covered_all.update(item.source_event_ids)

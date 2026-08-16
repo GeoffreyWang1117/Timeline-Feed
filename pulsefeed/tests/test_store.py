@@ -469,3 +469,53 @@ class TestPostgresSink:
         health = await sink.health()
         assert health["healthy"] is True
         assert health["pgvector"] is True
+
+    @pytest.mark.asyncio
+    async def test_restart_recovery_round_trip(self, sink):
+        """A durable record nobody reads back is a backup, not a database."""
+        from pulsefeed.clock import VirtualClock
+        from pulsefeed.pipeline import PipelineConfig, PulseFeedPipeline
+
+        event = ev("connection pool exhausted on db-primary")
+        await sink.save_event(event, embedding=HashingEmbedder().embed(event.content))
+        await sink.save_annotation(annotation([event.event_id]))
+        await sink.save_summary(summary(events=[event.event_id]))
+
+        memory = EntityMemory(entity_id="checkout", tenant_id="t")
+        memory.current_state = "degraded"
+        memory.severity = Severity.ERROR
+        memory.event_count = 4
+        memory.last_update = T0
+        await sink.save_entity(memory)
+
+        pipeline = PulseFeedPipeline(
+            config=PipelineConfig(worker_count=1, audit_sample_rate=0.0),
+            clock=VirtualClock(origin=T0),
+            sink=sink,
+        )
+        counts = await pipeline.restore("t")
+
+        assert counts["events"] == 1
+        assert counts["entities"] == 1
+        assert counts["summaries"] == 1
+        assert counts["items"] == 1
+
+        restored_memory = pipeline.entities.get("t", "checkout")
+        assert restored_memory is not None
+        assert restored_memory.current_state == "degraded"
+        assert restored_memory.severity is Severity.ERROR
+
+        items = pipeline.timeline("t", limit=10)
+        assert items
+        assert pipeline.evidence_for(items[0])[0].event_id == event.event_id
+
+    @pytest.mark.asyncio
+    async def test_load_summaries_excludes_superseded_by_default(self, sink):
+        active = summary("current belief")
+        retracted = summary("retracted belief")
+        retracted.status = SummaryStatus.SUPERSEDED
+        await sink.save_summary(active)
+        await sink.save_summary(retracted)
+
+        assert len(await sink.load_summaries("t")) == 1
+        assert len(await sink.load_summaries("t", active_only=False)) == 2
