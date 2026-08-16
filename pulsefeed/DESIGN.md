@@ -321,6 +321,73 @@ correct one, which is worse.
 
 ---
 
+## 7a. The system did not live up to its own thesis, in twelve places
+
+The thesis is boundedness: bounded queues, bounded entity memory, bounded
+prompts. An audit prompted by the question "what *else* grows with event
+count?" found twelve per-event structures with no cap at all — the event map,
+the annotation map, five index maps, three timing maps, both latency sample
+lists, the scorer's per-entity burst windows (one deque per entity ever seen),
+the scheduler's wait samples, and the summary store.
+
+Every finite harness run looked identical to a bounded system. That is the
+uncomfortable part: **a structure that grows forever and a structure that is
+bounded are indistinguishable in any test that ends.** Only an explicit cap
+assertion separates them, so the fix started with a test that ingests several
+multiples of the retention cap and asserts each structure held less than all of
+it (`tests/test_bounded_memory.py`).
+
+The bounds themselves are deliberately boring — oldest-first eviction, one pop
+per insert, amortised O(1) — because the interesting choices are what eviction
+*means* at each site:
+
+- Evicting an old **event** degrades `evidence_for` for ancient rows (which
+  already tolerated missing ids) and nothing else; the durable record in the
+  sink is unaffected.
+- Evicting a **burst window** just resets that entity's burst score.
+- The **summary store** evicts superseded summaries first — already replaced in
+  the live feed, the cheapest possible loss — and the full history stays in the
+  sink.
+- **Latency samples** became rolling windows, which is also the more useful
+  number operationally.
+
+The audit also found `_rolled_up`, a set that was added to on every rollup and
+never read. Deleted rather than bounded.
+
+---
+
+## 7b. Auth, rate limiting, and the digest cap-stone
+
+Three late additions that close documented gaps rather than break new ground;
+the design choices worth recording:
+
+**The key decides the tenant.** With `PULSEFEED_API_KEYS` set, a key bound to
+`acme` acts as `acme` no matter what the request body claims — the claim is
+*contained*, not rejected, because rejecting turns every misconfigured producer
+into an outage while overriding merely keeps it inside its own box. Isolation
+becomes a property of the credential instead of a request-body honour system.
+Auth precedes rate limiting, so a 401 cannot burn a tenant's token bucket; key
+comparison is `hmac.compare_digest` over a scan rather than a dict lookup,
+because at tens of keys the scan is free and the dict lookup is a timing side
+channel. With no keys configured everything is open — the dev default — and
+`/readyz` says `"disabled (dev mode)"` out loud, because an internet-facing
+deployment running open must not look identical to a working setup.
+
+**Rate limits are per (tenant, operation class)** token buckets, bounded like
+everything else (the bucket map evicts LRU past a cap — the limiter must not be
+the leak). Batch elements are charged individually; a batch is not a way around
+the per-event rate.
+
+**The digest is a read, so it does not write.** `GET /v1/digest` builds the
+hourly/daily rollup on demand — episodes in the window first, then leaves not
+already absorbed by one, so nothing is told twice — and does *not* persist by
+default: a dashboard polling every 30 seconds must not append 2,880 summaries a
+day to the audit trail. A scheduled job that wants the digest on the record
+passes `persist=True`. Extractive by default, LLM narration opt-in behind the
+same budget gate as episodes.
+
+---
+
 ## 8. Simulated time, and why the first attempt was wrong
 
 The harness needs to replay 15 minutes of traffic in seconds while reporting

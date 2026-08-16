@@ -10,6 +10,37 @@ admission and degradation policies, not the HTTP shape.
 
 ---
 
+## Authentication and rate limiting
+
+**Off by default** — with no keys configured, every route is open. That is the
+dev mode every quick start relies on, and `/readyz` reports
+`"auth": "disabled (dev mode)"` so an internet-facing deployment running open
+is visible instead of looking exactly like a working setup.
+
+```bash
+export PULSEFEED_API_KEYS="acme-key-1:acme,beta-key-1:beta,ops-key:*"
+export PULSEFEED_RATE_WRITE_PER_SECOND=200   # optional; default 200/s, burst 2x
+export PULSEFEED_RATE_READ_PER_SECOND=50     # optional; default 50/s, burst 2x
+```
+
+Send the key as `X-API-Key`. Semantics worth knowing:
+
+- **The key decides the tenant.** A key bound to `acme` acts as `acme` no
+  matter what `tenant_id` the body or query claims — the claim is contained,
+  not rejected, so a misconfigured producer stays in its own box instead of
+  becoming an outage. `key:*` makes an operator key that may choose a tenant.
+- **Auth precedes rate limiting.** A 401 consumes no tokens, so an
+  unauthenticated caller cannot burn a tenant's budget.
+- **Rate limits are per (tenant, class)** — writes and reads have separate
+  token buckets, charged against the tenant the *key* resolved to. Exceeding
+  them returns `429` with a `Retry-After` header. Batch elements are charged
+  individually; a batch is not a way around the per-event rate.
+- Key comparison is constant-time (`hmac.compare_digest`).
+- `/healthz`, `/readyz` and `/metrics` stay open: they are for the
+  infrastructure, not for tenants.
+
+---
+
 ## Ingest
 
 ### `POST /v1/events`
@@ -138,6 +169,40 @@ supersede rather than overwrite.
 
 ---
 
+### `GET /v1/digest`
+
+One summary of everything that mattered in the last window — the top of the
+`event → cluster → episode → digest` hierarchy.
+
+| parameter | default | notes |
+|---|---|---|
+| `tenant_id` | `default` | |
+| `window` | 3600 | seconds, up to 7 days |
+| `level` | `hourly` | or `daily` |
+| `narrate` | false | ask the model to write it as prose (budget-gated) |
+
+```json
+{
+  "tenant_id": "acme",
+  "window_seconds": 3600,
+  "digest": {
+    "level": "hourly",
+    "text": "SEV1: payments-api error rate above threshold... (+4 related updates)",
+    "severity": "critical",
+    "source_event_ids": ["evt_...", "..."],
+    "child_summary_ids": ["sum_...", "..."]
+  }
+}
+```
+
+Children are chosen to avoid double-telling: episodes in the window first, then
+any cluster/micro summary **not already absorbed** by one of them. Extractive by
+default, so it works with the provider down. **Not persisted** — a dashboard
+refresh must not grow the audit trail. `digest: null` with a reason when the
+window is empty.
+
+---
+
 ## Operations
 
 ### `GET /v1/stats`
@@ -196,9 +261,6 @@ stable and the content as mutable.
 
 ## Not implemented
 
-- Authentication and authorisation. `tenant_id` is taken from the request body;
-  **anything internet-facing needs an auth layer in front.**
-- Rate limiting at the HTTP boundary.
 - Pagination cursors — `limit` only.
 - WebSocket/SSE streaming of timeline updates.
 - A delete or redaction endpoint (GDPR-style erasure would need to reach raw

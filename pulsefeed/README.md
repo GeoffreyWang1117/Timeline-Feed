@@ -244,7 +244,7 @@ runs on the standard library.
 cd pulsefeed
 
 python demo.py                      # the worked example, annotated
-python -m pytest tests/ -q          # 203 tests
+python -m pytest tests/ -q          # 234 tests
 python -m harness.replay            # the A/B/C/D experiment
 python -m harness.frontier          # cost-quality sweep
 python -m harness.failure_injection # chaos scenarios
@@ -383,8 +383,10 @@ The experiment is worth exactly what its caveats allow.
    all history, and the read path is still in-process by design.
 5. **Single process.** Partitioning by `tenant_id`/`entity_id` is a design
    intention, not running code.
-6. **No authentication.** `tenant_id` comes from the request body; anything
-   internet-facing needs an auth layer in front.
+6. **Auth is off by default.** With `PULSEFEED_API_KEYS` set, the key decides
+   the tenant and per-tenant rate limits apply; unset, every route is open dev
+   mode — and `/readyz` says so, because an open internet-facing deployment
+   should not look identical to a working setup.
 
 ---
 
@@ -423,6 +425,7 @@ pulsefeed/
 │   ├── clock.py         real / scaled / virtual / manual clocks
 │   ├── metrics.py       Prometheus (optional)
 │   ├── api.py           FastAPI (optional)
+│   ├── auth.py          API keys → tenants, per-tenant token buckets
 │   ├── ingest.py        bus-driven ingest worker (consume → ingest → ack)
 │   ├── llm/             provider ABC, mock, OpenAI-compatible, breaker, prompts
 │   ├── learning/        dataset + IPS weighting, logistic fit, calibration,
@@ -435,7 +438,7 @@ pulsefeed/
 │   ├── frontier.py          cost-quality sweep
 │   ├── train.py             fit + evaluate the cheap scorer
 │   └── failure_injection.py chaos scenarios
-├── tests/                   203 tests (14 need Redis/Postgres)
+├── tests/                   234 tests (16 need Redis/Postgres)
 ├── docs/                    architecture, tuning, ops, API, training, zh/
 ├── demo.py
 └── DESIGN.md

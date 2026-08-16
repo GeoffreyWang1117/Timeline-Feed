@@ -94,6 +94,7 @@ class BoundedPriorityScheduler:
         self,
         config: Optional[SchedulerConfig] = None,
         clock: Optional[Clock] = None,
+        wait_sample_cap: int = 10_000,
     ) -> None:
         self.config = config or SchedulerConfig()
         self.clock = clock or RealClock()
@@ -112,7 +113,9 @@ class BoundedPriorityScheduler:
             "dispatched": 0,
         }
         self.dropped_by_class: Dict[Priority, int] = {p: 0 for p in Priority}
-        self.wait_samples: List[float] = []
+        # Rolling window, not a transcript: percentiles over the most recent
+        # dispatches are also the more useful number operationally.
+        self.wait_samples: Deque[float] = deque(maxlen=wait_sample_cap)
         self.max_depth_seen = 0
         # Per class, because classes saturate independently: P3 can be full and
         # shedding while total depth is nowhere near total capacity.
@@ -310,7 +313,7 @@ class BoundedPriorityScheduler:
         }
 
     def wait_percentiles(self) -> Dict[str, float]:
-        return percentiles(self.wait_samples)
+        return percentiles(list(self.wait_samples))
 
     def reset(self) -> None:
         for q in self._queues.values():

@@ -36,7 +36,7 @@ PulseFeed 把「调用 LLM」当作一个**在线控制动作**：针对每个�
 ```bash
 cd pulsefeed
 python demo.py                       # 15 条事件进去，一个事故故事出来，附成本
-python -m pytest tests/ -q           # 201 个测试
+python -m pytest tests/ -q           # 234 个测试
 python -m harness.replay             # A/B/C/D 对比实验
 python -m harness.frontier           # 成本-质量前沿扫描
 python -m harness.failure_injection  # 故障注入
@@ -162,7 +162,7 @@ Feed 内容**按定义就是不可信输入** —— 任何能在被监听频道
 3. **K=20 上排序落后**（84.2% vs 94.7%）。已诊断，未修复。
 4. **学习版 scorer 从未见过真实流量，也从未在 GPU 上跑过。**
 5. **单进程。** 按 `tenant_id`/`entity_id` 分片是设计意图，不是运行中的代码。
-6. **HTTP 层没有认证。** `tenant_id` 取自请求体；任何对公网暴露的部署都需要在前面加一层鉴权。
+6. **认证默认关闭。** 设置 `PULSEFEED_API_KEYS` 后，**key 决定租户**（绑定 `acme` 的 key 无论请求体怎么声明都只能作为 `acme` 行动），并按租户做读写分离的令牌桶限流（超限 429 + `Retry-After`）。不设置则是全开的开发模式 —— `/readyz` 会明确报告这一点，因为一个裸奔的公网部署不应该看起来和正常配置一模一样。
 
 ---
 

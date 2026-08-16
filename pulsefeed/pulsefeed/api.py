@@ -9,6 +9,7 @@ a demo and to let an operator see what the policy is doing:
     GET  /v1/timeline          the ranked feed
     GET  /v1/items/{id}/evidence   raw events behind an item
     GET  /v1/entities/{id}     entity memory + belief history
+    GET  /v1/digest            hourly/daily rollup of the recent window
     GET  /v1/stats             pipeline, queue, provider, budget snapshot
     GET  /metrics              Prometheus exposition
     GET  /healthz /readyz      liveness and readiness
@@ -26,7 +27,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 try:
-    from fastapi import Body, FastAPI, HTTPException, Query, Response
+    from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
     from pydantic import BaseModel, Field
 
     FASTAPI_AVAILABLE = True
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - optional dependency
     FASTAPI_AVAILABLE = False
     BaseModel = object  # type: ignore[assignment,misc]
 
+from .auth import ApiKeyRegistry, RateLimitConfig, TenantRateLimiter
 from .budget import TenantPlan
 from .clock import RealClock
 from .llm.provider import (
@@ -44,7 +46,7 @@ from .llm.provider import (
     ResilientProvider,
 )
 from .metrics import PROMETHEUS_AVAILABLE
-from .models import Event
+from .models import Event, SummaryLevel
 from .pipeline import PipelineConfig, PulseFeedPipeline
 
 
@@ -139,11 +141,11 @@ if FASTAPI_AVAILABLE:
         entity_ids: List[str] = Field(default_factory=list, max_length=16)
         metadata: Dict[str, Any] = Field(default_factory=dict)
 
-        def to_event(self, clock) -> Event:
+        def to_event(self, clock, tenant_id: Optional[str] = None) -> Event:
             return Event(
                 source=self.source,
                 content=self.content,
-                tenant_id=self.tenant_id,
+                tenant_id=tenant_id or self.tenant_id,
                 timestamp=self.timestamp
                 if self.timestamp is not None
                 else clock.now(),
@@ -152,8 +154,41 @@ if FASTAPI_AVAILABLE:
                 metadata=dict(self.metadata),
             )
 
-    def create_app(pipeline: Optional[PulseFeedPipeline] = None) -> "FastAPI":
+    def create_app(
+        pipeline: Optional[PulseFeedPipeline] = None,
+        registry: Optional[ApiKeyRegistry] = None,
+        limiter: Optional[TenantRateLimiter] = None,
+    ) -> "FastAPI":
         pipe = pipeline or create_pipeline()
+        keys = registry if registry is not None else ApiKeyRegistry.from_env()
+        rate = limiter if limiter is not None else TenantRateLimiter(
+            RateLimitConfig.from_env()
+        )
+
+        def guard(request: "Request", kind: str, requested_tenant: Optional[str]) -> str:
+            """Authenticate, resolve the effective tenant, and rate-limit.
+
+            Order matters: authentication first (an unauthenticated caller must
+            not be able to burn a tenant's rate budget), then the limit is
+            charged against the tenant the key resolved to — not the tenant the
+            body claimed.
+            """
+            principal = keys.resolve(request.headers.get("x-api-key"))
+            if principal is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="missing or invalid API key",
+                    headers={"WWW-Authenticate": "ApiKey"},
+                )
+            tenant = principal.effective_tenant(requested_tenant)
+            decision = rate.check(tenant, kind)
+            if not decision.allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail="rate limit exceeded",
+                    headers={"Retry-After": f"{decision.retry_after:.1f}"},
+                )
+            return tenant
 
         @asynccontextmanager
         async def lifespan(app: "FastAPI"):
@@ -172,30 +207,38 @@ if FASTAPI_AVAILABLE:
         app.state.pipeline = pipe
 
         @app.post("/v1/events", status_code=202)
-        async def ingest_event(event: EventIn) -> Dict[str, str]:
+        async def ingest_event(event: EventIn, request: Request) -> Dict[str, str]:
             """Accept an event. Returns as soon as it is scored and routed —
             never waits on the LLM."""
-            e = event.to_event(pipe.clock)
+            tenant = guard(request, "write", event.tenant_id)
+            e = event.to_event(pipe.clock, tenant)
             await pipe.ingest(e)
             return {"event_id": e.event_id, "status": "accepted"}
 
         @app.post("/v1/events:batch", status_code=202)
         async def ingest_batch(
-            events: List[EventIn] = Body(..., max_length=1000)
+            request: Request,
+            events: List[EventIn] = Body(..., max_length=1000),
         ) -> Dict[str, Any]:
             ids = []
             for event in events:
-                e = event.to_event(pipe.clock)
+                # Each element is charged and tenant-resolved individually: one
+                # wildcard-key batch may legitimately span tenants, and a batch
+                # must not be a way around the per-event rate.
+                tenant = guard(request, "write", event.tenant_id)
+                e = event.to_event(pipe.clock, tenant)
                 await pipe.ingest(e)
                 ids.append(e.event_id)
             return {"accepted": len(ids), "event_ids": ids}
 
         @app.get("/v1/timeline")
         async def get_timeline(
+            request: Request,
             tenant_id: str = Query("default"),
             limit: int = Query(20, ge=1, le=200),
             ranked: bool = Query(True),
         ) -> Dict[str, Any]:
+            tenant_id = guard(request, "read", tenant_id)
             items = pipe.timeline(tenant_id, limit=limit, ranked=ranked)
             return {
                 "tenant_id": tenant_id,
@@ -206,13 +249,14 @@ if FASTAPI_AVAILABLE:
 
         @app.get("/v1/items/{item_id}/evidence")
         async def get_evidence(
-            item_id: str, tenant_id: str = Query("default")
+            item_id: str, request: Request, tenant_id: str = Query("default")
         ) -> Dict[str, Any]:
             """Expand a summary back into the raw events it claims to describe.
 
             This endpoint is why hallucination is survivable: no conclusion the
             system shows is unfalsifiable.
             """
+            tenant_id = guard(request, "read", tenant_id)
             for item in pipe.timeline(tenant_id, limit=10 ** 9):
                 if item.item_id == item_id:
                     return {
@@ -223,8 +267,9 @@ if FASTAPI_AVAILABLE:
 
         @app.get("/v1/entities/{entity_id}")
         async def get_entity(
-            entity_id: str, tenant_id: str = Query("default")
+            entity_id: str, request: Request, tenant_id: str = Query("default")
         ) -> Dict[str, Any]:
+            tenant_id = guard(request, "read", tenant_id)
             memory = pipe.entities.get(tenant_id, entity_id)
             if memory is None:
                 raise HTTPException(status_code=404, detail="entity not found")
@@ -238,8 +283,42 @@ if FASTAPI_AVAILABLE:
                 "belief_history": [s.to_dict() for s in history],
             }
 
+        @app.get("/v1/digest")
+        async def get_digest(
+            request: Request,
+            tenant_id: str = Query("default"),
+            window: float = Query(3600.0, gt=0, le=7 * 86400),
+            level: str = Query("hourly", pattern="^(hourly|daily)$"),
+            narrate: bool = Query(False),
+        ) -> Dict[str, Any]:
+            """One summary of everything that mattered in the last window.
+
+            The top of the summarisation hierarchy. Extractive by default (works
+            with the provider down); ``narrate=true`` asks the model to write it
+            as prose, subject to the same budget gate as episode narration. Not
+            persisted — a dashboard refresh must not grow the audit trail.
+            """
+            tenant_id = guard(request, "read", tenant_id)
+            digest = await pipe.build_digest(
+                tenant_id,
+                window_seconds=window,
+                level=SummaryLevel.DAILY if level == "daily" else SummaryLevel.HOURLY,
+                narrate=narrate,
+            )
+            if digest is None:
+                return {"tenant_id": tenant_id, "window_seconds": window,
+                        "digest": None, "reason": "no summaries in window"}
+            return {
+                "tenant_id": tenant_id,
+                "window_seconds": window,
+                "digest": digest.to_dict(),
+            }
+
         @app.get("/v1/stats")
-        async def get_stats(tenant_id: str = Query("default")) -> Dict[str, Any]:
+        async def get_stats(
+            request: Request, tenant_id: str = Query("default")
+        ) -> Dict[str, Any]:
+            tenant_id = guard(request, "read", tenant_id)
             snapshot = pipe.snapshot()
             snapshot["budget"] = pipe.ledger.snapshot(tenant_id)
             return snapshot
@@ -273,6 +352,11 @@ if FASTAPI_AVAILABLE:
                     name: b.state.value
                     for name, b in pipe.provider.breakers.items()
                 },
+                # An internet-facing deployment running with auth disabled is a
+                # misconfiguration that looks exactly like a working dev setup.
+                # Making it visible here is the difference.
+                "auth": "enabled" if keys.enabled else "disabled (dev mode)",
+                "rate_limit_denials": rate.denials,
                 "prometheus": PROMETHEUS_AVAILABLE,
             }
 

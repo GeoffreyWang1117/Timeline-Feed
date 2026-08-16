@@ -25,6 +25,9 @@ uvicorn pulsefeed.api:create_app --factory --host 0.0.0.0 --port 8000
 | `PULSEFEED_AUDIT_RATE` | 0.01 | audit sampling rate |
 | `PULSEFEED_TOKEN_BUDGET` | 500000 | daily tokens |
 | `PULSEFEED_USD_BUDGET` | 5.0 | daily dollars |
+| `PULSEFEED_API_KEYS` | — | `key:tenant` pairs; `key:*` = operator. Unset = auth **off** |
+| `PULSEFEED_RATE_WRITE_PER_SECOND` | 200 | per-tenant write rate (burst 2x) |
+| `PULSEFEED_RATE_READ_PER_SECOND` | 50 | per-tenant read rate (burst 2x) |
 
 **Nothing above is required.** With no provider configured the system falls back
 to a deterministic mock; with no `PULSEFEED_SCORER_MODEL` it uses hand-tuned
@@ -43,6 +46,10 @@ curl -s localhost:8000/metrics    # Prometheus exposition
 **Check this after deploying a fitted model** — a bad model file falls back
 silently by design, and a silent fallback looks identical to a deliberate
 hand-tuned deploy without this field.
+
+It also reports `"auth": "enabled"` or `"disabled (dev mode)"`. **An
+internet-facing deployment showing dev mode is a misconfiguration** that would
+otherwise look exactly like a working setup.
 
 ---
 
@@ -246,8 +253,13 @@ events even if it tries.
 Budgets are per tenant with a P0 reservation, so one tenant's noisy day cannot
 consume the capacity another tenant's incident will need.
 
-**Not implemented:** per-tenant rate limiting at the HTTP boundary, and
-cross-tenant fairness in the scheduler (the queue is shared).
+When `PULSEFEED_API_KEYS` is set, the key decides the tenant — a key bound to
+`acme` cannot read or write any other tenant's data regardless of what the
+request claims — and per-tenant token buckets rate-limit reads and writes
+separately (429 + `Retry-After` past the burst).
+
+**Not implemented:** cross-tenant fairness in the scheduler (the queue is
+shared).
 
 ---
 

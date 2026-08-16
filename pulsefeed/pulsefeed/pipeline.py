@@ -27,9 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Deque, Dict, List, Optional, Sequence
 
 from .budget import BudgetLedger, TenantPlan
 from .clock import Clock, RealClock
@@ -83,6 +83,13 @@ class PipelineConfig:
     timeline_capacity: int = 2000       # items retained per tenant
     episode_interval: float = 120.0     # simulated seconds between rollup passes
     feature_memory: int = 20_000        # scored vectors retained for training/debug
+    # Per-event bookkeeping retention. The system's thesis is boundedness, and
+    # for a while its own bookkeeping did not live up to it: events, timing
+    # maps, index maps and latency samples all grew one entry per event,
+    # forever. Finite harness runs never showed it; only an explicit cap test
+    # did. Everything below evicts oldest-first past this cap.
+    event_retention: int = 50_000
+    latency_sample_cap: int = 10_000
     enable_metrics: bool = True
     seed: int = 1337
 
@@ -165,14 +172,17 @@ class PulseFeedPipeline:
         self._item_by_cluster: Dict[str, TimelineItem] = {}
         self._cluster_summary: Dict[str, Summary] = {}
         self._item_by_summary: Dict[str, TimelineItem] = {}
-        self._rolled_up: set = set()
         # (tenant, entity) -> (child signature, current episode summary)
         self._open_episodes: Dict[tuple, tuple] = {}
         self._path_by_event: Dict[str, PathTaken] = {}
         self._ingest_time: Dict[str, float] = {}
         self._visible_at: Dict[str, float] = {}
         self.last_features: Dict[str, EventFeatures] = {}
-        self.end_to_end_samples: Dict[str, List[float]] = {"cheap": [], "llm": []}
+        cap = self.config.latency_sample_cap
+        self.end_to_end_samples: Dict[str, Deque[float]] = {
+            "cheap": deque(maxlen=cap),
+            "llm": deque(maxlen=cap),
+        }
 
         # Why work was turned away, kept in-process so a test or a dashboard can
         # tell "we were over budget" apart from "the answer would have been
@@ -382,6 +392,7 @@ class PulseFeedPipeline:
         now = self.clock.now()
         self.events[event.event_id] = event
         self._ingest_time[event.event_id] = now
+        self._enforce_retention()
         self.stats.events_ingested += 1
         self.metrics.events_ingested.labels(event.tenant_id, event.source).inc()
 
@@ -406,6 +417,38 @@ class PulseFeedPipeline:
     async def ingest_many(self, events: Sequence[Event]) -> None:
         for event in events:
             await self.ingest(event)
+
+    @staticmethod
+    def _evict_fifo(mapping, cap: int) -> None:
+        """Drop oldest-inserted entries past ``cap``.
+
+        Python dicts iterate in insertion order, which for these maps is ingest
+        order, so oldest-first eviction is one pop of the first key. Amortised
+        O(1) per ingest: each call inserts one entry and evicts at most a few.
+        """
+        while len(mapping) > cap:
+            mapping.pop(next(iter(mapping)))
+
+    def _enforce_retention(self) -> None:
+        """Keep every per-event structure inside ``event_retention``.
+
+        Evicting an old event degrades gracefully everywhere it is read:
+        ``evidence_for`` already skips missing ids, path accounting simply
+        forgets ancient events, and the durable record in the sink is unaffected
+        — this is serving-memory hygiene, not data loss.
+        """
+        cap = self.config.event_retention
+        for mapping in (
+            self.events,
+            self._path_by_event,
+            self._ingest_time,
+            self._visible_at,
+            self.annotations,
+            self._item_by_cluster,
+            self._cluster_summary,
+            self._item_by_summary,
+        ):
+            self._evict_fifo(mapping, cap)
 
     def _remember_features(self, event_id: str, features: "EventFeatures") -> None:
         """Keep the last N scored feature vectors, bounded.
@@ -873,6 +916,64 @@ class PulseFeedPipeline:
         self.metrics.llm_cost_usd.labels(tenant_id).inc(annotation.cost_usd)
         return annotation.summary
 
+    async def build_digest(
+        self,
+        tenant_id: str,
+        window_seconds: float = 3600.0,
+        level: SummaryLevel = SummaryLevel.HOURLY,
+        narrate: bool = False,
+        persist: bool = False,
+    ) -> Optional[Summary]:
+        """One summary of everything that mattered in the last window.
+
+        This is the top of the hierarchy the plan promised — the levels existed
+        in the enum for a while before anything actually built them.
+
+        Children are chosen to avoid double-telling: episodes in the window
+        first, then any cluster/micro summary in the window **not already
+        absorbed by one of those episodes**. ``extractive_rollup`` then leads
+        with the most severe child, which is how a human skims an incident
+        channel.
+
+        Deliberately **not persisted by default**: this is a read, and a GET
+        that appends a new summary per call would grow the store with every
+        dashboard refresh. Pass ``persist=True`` for a scheduled digest job that
+        should land in the audit trail.
+        """
+        cutoff = self.clock.now() - window_seconds
+
+        episodes = [
+            s
+            for s in self.summaries.active(SummaryLevel.EPISODE, tenant_id)
+            if s.generated_at >= cutoff
+        ]
+        absorbed = {
+            child_id for episode in episodes for child_id in episode.child_summary_ids
+        }
+        leaves = [
+            s
+            for lvl in (SummaryLevel.CLUSTER, SummaryLevel.MICRO)
+            for s in self.summaries.active(lvl, tenant_id)
+            if s.generated_at >= cutoff and s.summary_id not in absorbed
+        ]
+        children = episodes + leaves
+        if not children:
+            return None
+
+        children.sort(key=lambda s: (-s.severity.rank, -s.generated_at))
+        children = children[: self.rollup.config.max_children_per_rollup]
+
+        digest = self.rollup.extractive_rollup(children, level)
+        if narrate:
+            text = await self._generate_episode_text(children, level)
+            if text:
+                digest.text = text
+                digest.model = "llm"
+        if persist:
+            self.summaries.add(digest)
+            await self._persist(self.sink.save_summary(digest))
+        return digest
+
     def _publish_episode_item(
         self,
         episode: Summary,
@@ -938,7 +1039,6 @@ class PulseFeedPipeline:
         item.rank_score = item.base_rank
         for child_item in child_items:
             child_item.rolled_up_into = item.item_id
-            self._rolled_up.add(child_item.item_id)
 
     def _find_contradicted_summary(
         self, cluster: EventCluster, annotation: SemanticAnnotation

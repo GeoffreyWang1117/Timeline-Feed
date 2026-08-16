@@ -250,6 +250,12 @@ class ScorerConfig:
     burst_saturation: int = 8          # events/entity/window that means "bursting"
     recency_half_life: float = 900.0   # seconds
     tokens_per_char: float = 0.27      # rough English tokenisation ratio
+    # Rolling-state caps. Burst windows are keyed by entity and novelty windows
+    # by tenant; without these caps every entity and tenant ever seen kept its
+    # key alive forever. Evicting oldest-first just resets that entity's burst
+    # score / that tenant's novelty window — a scoring degradation, not a leak.
+    max_tracked_entities: int = 50_000
+    max_tracked_tenants: int = 1_000
     context_token_overhead: int = 320  # system prompt + entity memory
     usd_per_1k_tokens: float = 0.0015
 
@@ -316,6 +322,8 @@ class CheapScorer:
         window = self._recent_vectors.setdefault(
             tenant_id, deque(maxlen=self.config.novelty_window)
         )
+        while len(self._recent_vectors) > self.config.max_tracked_tenants:
+            self._recent_vectors.pop(next(iter(self._recent_vectors)))
         duplication = max(0.0, max_similarity(vector, window))
         window.append(vector)
         return 1.0 - duplication, duplication
@@ -323,6 +331,8 @@ class CheapScorer:
     def _burst(self, event: Event, now: float) -> float:
         key = (event.tenant_id, event.primary_entity)
         window = self._entity_events.setdefault(key, deque())
+        while len(self._entity_events) > self.config.max_tracked_entities:
+            self._entity_events.pop(next(iter(self._entity_events)))
         window.append(event.timestamp)
         cutoff = now - self.config.burst_window_seconds
         while window and window[0] < cutoff:

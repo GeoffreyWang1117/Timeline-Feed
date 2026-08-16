@@ -41,19 +41,51 @@ PARENT_LEVEL: Dict[SummaryLevel, Optional[SummaryLevel]] = {
 
 
 class SummaryStore:
-    """Append-only store of summaries with explicit supersede links."""
+    """Append-only store of summaries with explicit supersede links.
 
-    def __init__(self) -> None:
+    Append-only in *semantics* (nothing is ever overwritten), bounded in
+    *memory*: past ``max_summaries`` the oldest summaries are evicted, preferring
+    superseded ones — the durable audit trail lives in the sink, and this store
+    is the serving window over it.
+    """
+
+    def __init__(self, max_summaries: int = 100_000) -> None:
+        self.max_summaries = max_summaries
         self._by_id: Dict[str, Summary] = {}
         self._by_level: Dict[SummaryLevel, List[str]] = defaultdict(list)
         self._by_entity: Dict[tuple, List[str]] = defaultdict(list)
+        self.evictions = 0
 
     def add(self, summary: Summary) -> Summary:
         self._by_id[summary.summary_id] = summary
         self._by_level[summary.level].append(summary.summary_id)
         for entity_id in summary.entity_ids:
             self._by_entity[(summary.tenant_id, entity_id)].append(summary.summary_id)
+        self._evict_if_needed()
         return summary
+
+    def _evict_if_needed(self) -> None:
+        while len(self._by_id) > self.max_summaries:
+            victim = None
+            # First pass: oldest-inserted superseded summary — already replaced
+            # in the live feed, cheapest possible loss.
+            for sid, summary in self._by_id.items():
+                if summary.status is SummaryStatus.SUPERSEDED:
+                    victim = sid
+                    break
+            if victim is None:
+                victim = next(iter(self._by_id))
+            self._by_id.pop(victim, None)
+            self.evictions += 1
+        # Index lists hold ids of evicted summaries until compaction; reads
+        # guard on _by_id membership, and compaction keeps the lists from
+        # growing more than 2x past the live set.
+        for level, ids in list(self._by_level.items()):
+            if len(ids) > 2 * self.max_summaries:
+                self._by_level[level] = [i for i in ids if i in self._by_id]
+        for key, ids in list(self._by_entity.items()):
+            if len(ids) > 2 * self.max_summaries:
+                self._by_entity[key] = [i for i in ids if i in self._by_id]
 
     def get(self, summary_id: str) -> Optional[Summary]:
         return self._by_id.get(summary_id)
@@ -68,8 +100,8 @@ class SummaryStore:
         )
         out = []
         for sid in ids:
-            s = self._by_id[sid]
-            if s.status is not SummaryStatus.ACTIVE:
+            s = self._by_id.get(sid)
+            if s is None or s.status is not SummaryStatus.ACTIVE:
                 continue
             if tenant_id is not None and s.tenant_id != tenant_id:
                 continue
@@ -77,8 +109,15 @@ class SummaryStore:
         return out
 
     def history_for_entity(self, tenant_id: str, entity_id: str) -> List[Summary]:
-        """Every belief ever held about this entity, superseded ones included."""
-        return [self._by_id[sid] for sid in self._by_entity[(tenant_id, entity_id)]]
+        """Every belief still in the serving window, superseded ones included.
+
+        The complete history lives in the sink; this is the in-memory slice.
+        """
+        return [
+            self._by_id[sid]
+            for sid in self._by_entity[(tenant_id, entity_id)]
+            if sid in self._by_id
+        ]
 
     def supersede(self, old_summary_id: str, new_summary: Summary) -> Summary:
         """Replace a conclusion while keeping the one it replaced.
