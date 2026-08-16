@@ -43,7 +43,7 @@ pulsefeed-frontier = "harness.frontier:main"
 pulsefeed-chaos = "harness.failure_injection:main"
 
 [tool.setuptools]
-packages = ["pulsefeed", "pulsefeed.llm", "harness"]
+packages = ["pulsefeed", "pulsefeed.llm", "pulsefeed.store", "harness"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -67,16 +67,60 @@ class TestCoalescer:
         assert clusters[0].size == 10
         assert clusters[0].coalesced_count == 9
 
-    def test_topic_change_starts_a_new_cluster(self):
+    def test_topic_change_opens_a_second_cluster_without_closing_the_first(self):
+        """Two unrelated things on one entity are two clusters, concurrently.
+
+        The earlier design closed the open cluster whenever a dissimilar event
+        arrived, so an entity carrying interleaved topics never accumulated
+        anything.
+        """
         coalescer, scorer = Coalescer(), CheapScorer()
         self._offer(coalescer, scorer, make_event("db cpu usage 90%", "db", T0))
         emitted = self._offer(
             coalescer,
             scorer,
-            make_event("db connection pool exhausted, queries failing", "db", T0 + 2),
+            make_event("db replication lag climbing steadily", "db", T0 + 2),
         )
-        assert emitted[0].close_reason == "topic_changed"
-        assert emitted[0].size == 1  # the original cluster, not merged into
+        assert emitted == []
+        assert coalescer.open_cluster_count() == 2
+        assert len(coalescer.flush(T0 + 200)) == 2
+
+    def test_interleaved_conversations_each_accumulate(self):
+        """The regression this design exists to prevent.
+
+        A busy channel alternates between topics. Each should coalesce with its
+        own kind rather than each event evicting the previous cluster.
+        """
+        coalescer, scorer = Coalescer(), CheapScorer()
+        pairs = [
+            "deployment pipeline is stuck on the approval step",
+            "lunch options for today are pizza or salad",
+        ]
+        for i in range(6):
+            self._offer(
+                coalescer,
+                scorer,
+                make_event(pairs[i % 2], "general", T0 + i * 2, "slack"),
+            )
+        clusters = coalescer.flush(T0 + 300)
+        assert len(clusters) == 2, [c.size for c in clusters]
+        assert sorted(c.size for c in clusters) == [3, 3]
+
+    def test_open_clusters_per_entity_are_bounded(self):
+        config = CoalescerConfig(max_open_per_entity=2)
+        coalescer, scorer = Coalescer(config), CheapScorer()
+        topics = [
+            "deployment pipeline stuck on approval",
+            "lunch options today pizza or salad",
+            "quarterly planning document review needed",
+        ]
+        emitted = []
+        for i, topic in enumerate(topics):
+            emitted += self._offer(
+                coalescer, scorer, make_event(topic, "general", T0 + i * 2, "slack")
+            )
+        assert coalescer.open_cluster_count() == 2
+        assert any(c.close_reason == "max_open" for c in emitted)
 
     def test_max_size_one_disables_coalescing_without_adding_latency(self):
         coalescer = Coalescer(CoalescerConfig(max_cluster_size=1))
@@ -107,8 +151,9 @@ class TestCoalescer:
             make_event("checkout latency high", "checkout", T0, "grafana"),
         )
         emitted = self._offer(joining, scorer, p0, now=T0 + 3)
-        assert any(c.close_reason == "p0_member" for c in emitted)
-        assert joining.open_cluster_count() == 0
+        released = [c for c in emitted if c.close_reason == "p0_member"]
+        assert released, "the P0 was left sitting in an open cluster"
+        assert p0.event_id in released[0].event_ids
 
     def test_idle_timeout_closes_open_clusters(self):
         coalescer, scorer = Coalescer(CoalescerConfig(idle_close_seconds=10)), CheapScorer()

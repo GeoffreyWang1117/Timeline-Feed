@@ -137,6 +137,44 @@ Under load the coalescer widens its windows instead of the queue growing. This
 degrades *resolution*, not *coverage* — the same events, described in fewer,
 coarser items. It is the first thing given up, long before anything is dropped.
 
+### Several clusters open per entity
+
+Keying clusters on entity is right; keeping only *one* open per entity was not.
+A busy Slack channel is a single entity carrying several unrelated conversations
+at once, so with one open cluster every arriving event was dissimilar to the
+current one, closed it as `topic_changed`, and opened its own — and nothing ever
+coalesced. The feed filled with near-duplicate single-line rows: five separate
+"sharing a good article on distributed tracing" items in one page.
+
+A new event is now matched against *all* clusters open for its entity and joins
+the best one, with a bounded number (`max_open_per_entity`) and the stalest
+evicted when that bound is hit. On the standard trace this cut PulseFeed's item
+count from 4,718 to 1,712 and lifted R@50 from 89.5% to 97.4%.
+
+### Publishing early, grouping late
+
+The fix above immediately broke something else, and the breakage was more
+interesting than the fix. Clusters that used to be closed early by topic changes
+now lived out their full window — and because a cluster reached the feed only
+*when it closed*, p95 time-to-feed went from 18s to 45s. Narrowing the window
+gave the latency back and took the grouping away with it.
+
+The real problem was that `window_seconds` controlled two unrelated things:
+how well events group, and how long a reader waits to see anything. Those want
+opposite values.
+
+They are now decoupled. `drain_touched()` hands the pipeline a provisional
+snapshot every time a cluster opens *or grows*, and the pipeline writes or
+refreshes that cluster's single row in place. An event is visible the moment it
+is ingested; the window becomes purely a grouping parameter. Measured
+time-to-feed went to 0.00s at p50, p95 *and* p99, with the wide window and its
+grouping quality kept.
+
+One subtlety worth recording: the first version of this published only on
+*open*. p95 barely moved, because every event that joined an existing cluster
+still waited for the close. Covering growth as well as opening was the actual
+fix.
+
 ---
 
 ## 4. Raw events are canonical; LLM output is annotation
@@ -200,12 +238,14 @@ of the capacity while guaranteeing every class a floor. There is a test that
 fails under strict priority.
 
 An observation worth stating plainly, because the failure-injection results
-show it: **with load-aware admission enabled, the bounded queue almost never
-overflows.** At 50x offered load the peak queue depth is 1. Threshold raising
-and coalescing absorb the burst upstream; shedding is the last line of defence
-and mostly sits idle. That is good behaviour and bad testing, so there is a
-separate scenario that disables load-awareness and starves capacity purely to
-exercise the shedding path and confirm the ordering (P3 sheds, P0 never does).
+show it: **with load-aware admission enabled, the bounded queue never
+overflows.** At a measured 45.6x offered load (3.3 → 151.5 events/s) the peak
+queue depth is *zero* — coalescing folded 15,872 events away and the utility
+threshold refused the rest, so the load-aware term never engaged and the
+overflow policies never ran. That is good behaviour and bad testing, so there
+is a separate scenario that disables load-awareness and starves capacity purely
+to exercise the shedding path and confirm the ordering (P3 sheds 89 items, P2
+falls back to the cheap path, P0 and P1 are never dropped).
 
 ---
 
@@ -283,6 +323,67 @@ uses.
 
 ---
 
+## 8a. Ranking, and two things it was getting wrong
+
+Ranking is the weakest part of the system and the diagnosis is worth keeping
+because both faults were invisible in the aggregate metrics and obvious the
+moment the top 40 rows were printed with their scores.
+
+**User relevance was decaying with novelty.** `@alice can you review this?`
+scored 0.400 at rank 4 and 0.251 at rank 34 — identical intent, very different
+score. `user_relevance` feeds into `importance`, but so does novelty, so the
+fifth similarly-worded mention looked less important than the first. Being
+addressed directly is categorical; it does not get less relevant because the
+phrasing is stale. It is now applied outside `importance` and weighted heavily.
+
+**Entity memory was never consulted when ranking.** "deployment #813 completed"
+is lexically boring and a keyword scorer has no way to know better — but the
+same sentence about a service *currently in a degraded state* is the most
+interesting line in the feed. The state was already tracked and used only for
+prompting. It now contributes a boost, applied **at read time** rather than at
+publish time, because the verdict that a service is degraded usually lands after
+the routine-looking event was already written.
+
+Both helped, and neither closed the gap: at K=20 PulseFeed still trails
+LLM-everything (81.6% vs 94.7%), with relevant items at ranks 1–7 and then not
+again until 24. Ranks 8–23 are still occupied by novel-but-worthless chatter.
+Novelty is doing too much work in `importance` and the fix is probably a trained
+classifier rather than more hand-tuned weights.
+
+---
+
+## 8b. Durability: bus and sink
+
+Two interfaces, deliberately separate because their failure modes are opposite.
+
+**`EventBus`** is the ingestion boundary — Redis Streams today, the same five
+methods for Kafka later. At-least-once with explicit acks: an event is not
+considered handled until the pipeline says so, so a worker that dies mid-flight
+costs latency, not data. `reclaim_stale` exists because without it, deliveries
+stranded by a dead consumer stay pending forever — durable, with nobody coming
+to collect them. Retention is bounded (`MAXLEN ~`), since an unbounded stream
+converts a slow consumer into a Redis OOM.
+
+**`PersistenceSink`** is the durable record — Postgres, with pgvector when the
+extension is present and a `real[]` column plus in-Python cosine when it is not.
+The fallback is genuinely slower and says so; it exists so the system runs on
+stock Postgres, not to pretend the two are equivalent. Every write is an upsert,
+because at-least-once delivery means redelivery must be boring.
+
+Policy: the bus fails **closed** (buffer and replay — a lost raw event is
+unrecoverable), the sink fails **open** (keep serving, count the failure — a
+delayed write is recoverable, and putting a database on the read path of a feed
+whose entire premise is surviving its dependencies would be self-defeating).
+
+The in-memory implementations model the same semantics on purpose, so bugs
+surface in tests. That paid off immediately and embarrassingly: the in-memory
+bus ignored `min_idle_ms` in `reclaim_stale` and handed a consumer its own
+in-flight batch back on the next loop. The bus-crash scenario caught it — 2,657
+events published, 5,146 ingested. Honouring idle time (and refusing to reclaim
+from yourself) fixed it to exactly 2,657.
+
+---
+
 ## 9. Known limitations
 
 Stated plainly, because the experiment is only worth what its caveats allow.
@@ -310,12 +411,12 @@ Stated plainly, because the experiment is only worth what its caveats allow.
    matters.
 
    The coverage curve is also not clean: enriched coverage peaks at θ=0.15
-   (65.8%) rather than at the cheapest threshold (63.2% at θ=0.05), and
+   (68.4%) rather than at the cheapest threshold (63.2% at θ=0.05), and
    storyline coverage is non-monotonic (60% at θ=0.05, 100% at θ=0.35). With 38
    important events and 5 storylines the sample is far too small for those
-   wiggles to mean anything. Treat the curve's *shape* — spend range, marginal
-   returns falling roughly 10x from the cheap end — as the finding, not any
-   individual point.
+   wiggles to mean anything. Treat the curve's *shape* — a 9x spend range with
+   marginal returns falling roughly 6x from the cheap end — as the finding, not
+   any individual point.
 
 4. **Episodes are built from cluster summaries, so cheap-path events do not join
    them.** In the demo, "deployment #813 completed" is causally central but
@@ -323,11 +424,16 @@ Stated plainly, because the experiment is only worth what its caveats allow.
    never earned an LLM call. Including cheap items in rollups is the obvious
    next step.
 
-5. **Storage is in-process.** Redis Streams and Postgres/pgvector are designed
-   for (the stores sit behind interfaces) but not implemented; everything is
-   in-memory and bounded. Durability across restarts is not there yet.
+5. **Ranking trails at K=20.** 81.6% against LLM-everything's 94.7%, with
+   precision@20 of 60% against 95%. Diagnosed in §8a, not fixed.
 
-6. **Single-process.** Horizontal scaling by `tenant_id`/`entity_id` partition is
+6. **Persistence is write-through, not read-through.** The bus and sink are
+   implemented and tested against real Redis and Postgres+pgvector, but the
+   in-memory structures are still the serving path and nothing reloads them on
+   restart. Durable ingestion and a durable record exist; durable *serving* does
+   not.
+
+7. **Single-process.** Horizontal scaling by `tenant_id`/`entity_id` partition is
    a design intention, not running code.
 
 ---

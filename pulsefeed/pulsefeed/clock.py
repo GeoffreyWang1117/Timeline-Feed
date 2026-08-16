@@ -125,7 +125,6 @@ class VirtualClock:
         if no task became runnable and nothing woke up, conclude that everyone
         is parked on a timer and advance the clock to the earliest one.
         """
-        import heapq
 
         steps = 0
         while steps < max_steps:

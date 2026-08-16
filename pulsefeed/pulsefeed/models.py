@@ -325,6 +325,11 @@ class TimelineItem:
     # is kept — it is still the evidence trail for the episode above it — but it
     # no longer competes for a slot in the default feed.
     rolled_up_into: Optional[str] = None
+    # The static part of the score, computed once when the item is written.
+    # ``rank_score`` is this plus live adjustments (currently the entity-state
+    # boost) recomputed on every read, so an item that becomes interesting after
+    # publication rises without the feed having to rewrite every row.
+    base_rank: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {

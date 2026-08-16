@@ -207,7 +207,6 @@ class TestDegradation:
     async def test_p0_bypasses_an_exhausted_shared_budget(self):
         """The reservation exists so a noisy day cannot consume the capacity an
         incident will need."""
-        clock = VirtualClock(origin=T0)
         ledger = BudgetLedger()
         ledger.register(
             TenantPlan(

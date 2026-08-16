@@ -314,7 +314,7 @@ class CheapScorer:
 
     def score(self, event: Event, now: Optional[float] = None) -> EventFeatures:
         now = now if now is not None else time.time()
-        cfg, w = self.config, self.config.weights
+        w = self.config.weights
 
         from .embedding import tokenize  # local import keeps module import cheap
 

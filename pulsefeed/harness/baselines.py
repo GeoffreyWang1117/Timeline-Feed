@@ -23,7 +23,7 @@ from pulsefeed.clock import Clock, VirtualClock
 from pulsefeed.coalescer import Coalescer, CoalescerConfig
 from pulsefeed.llm.provider import MockConfig, MockProvider, ResilienceConfig, ResilientProvider
 from pulsefeed.metrics import PulseFeedMetrics
-from pulsefeed.models import Event, EventFeatures, Priority, TimelineItem
+from pulsefeed.models import Event, EventFeatures, Priority
 from pulsefeed.pipeline import PipelineConfig, PulseFeedPipeline
 from pulsefeed.scheduler import BoundedPriorityScheduler, SchedulerConfig, percentiles
 from pulsefeed.scoring import CheapScorer, TenantAffinity
@@ -166,6 +166,11 @@ class ArmResult:
     precision_at_k: Dict[int, float] = field(default_factory=dict)
     recall_total: float = 0.0
     enriched_recall_at_k: Dict[int, float] = field(default_factory=dict)
+    # How many timeline slots a reader must get through to reach a given
+    # important-event recall. precision@K flatters systems that spread one
+    # incident across many rows and penalises ones that pack it into a single
+    # item, so scroll depth is the metric that matches what a user experiences.
+    items_to_recall: Dict[int, Optional[int]] = field(default_factory=dict)
     # Of all ground-truth-important events, how many are presented anywhere in
     # the feed with an LLM-written explanation rather than a raw line?
     enriched_important_coverage: float = 0.0
@@ -192,6 +197,7 @@ class ArmResult:
         out["enriched_recall_at_k"] = {
             str(k): v for k, v in self.enriched_recall_at_k.items()
         }
+        out["items_to_recall"] = {str(k): v for k, v in self.items_to_recall.items()}
         return out
 
 
@@ -330,6 +336,17 @@ def evaluate(
             len(enriched_covered & important_ids) / total_important, 4
         )
 
+    running: set = set()
+    targets = [50, 80, 95]
+    for position, item in enumerate(all_items, 1):
+        running |= set(item.source_event_ids) & important_ids
+        for target in list(targets):
+            if len(running) / total_important >= target / 100.0:
+                result.items_to_recall[target] = position
+                targets.remove(target)
+    for target in targets:
+        result.items_to_recall[target] = None  # never reached
+
     all_covered = set()
     enriched_covered_all = set()
     for item in all_items:
@@ -411,12 +428,20 @@ async def run_arm(
     await pipeline.start()
 
     feeder_done = False
+    feeder_error: List[BaseException] = []
 
     async def feeder() -> None:
         nonlocal feeder_done
         try:
             await feed_events(pipeline, events, clock)
             await pipeline.flush()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            # A feeder that dies silently produces a partial run that looks like
+            # a policy result. This happened once (a KeyError in the coalescer
+            # close path) and the numbers were wrong rather than obviously
+            # broken, so failures are now surfaced rather than swallowed.
+            feeder_error.append(exc)
+            raise
         finally:
             feeder_done = True
 
@@ -427,6 +452,10 @@ async def run_arm(
         feeder_task.cancel()
         await asyncio.gather(feeder_task, return_exceptions=True)
         await pipeline.stop(drain=False)
+    if feeder_error:
+        raise RuntimeError(
+            f"arm {spec.key} feeder failed; results discarded"
+        ) from feeder_error[0]
     wall = _time.monotonic() - started
 
     result = evaluate(pipeline, spec, events, important_ids, k_values, tenant_id)

@@ -30,7 +30,9 @@ from pulsefeed.llm.prompts import (
 from pulsefeed.llm.provider import MockConfig
 from pulsefeed.models import Event, Priority
 from pulsefeed.pipeline import PulseFeedPipeline
+from pulsefeed.ingest import IngestConfig, IngestWorker
 from pulsefeed.scheduler import BoundedPriorityScheduler, SchedulerConfig
+from pulsefeed.store import InMemoryEventBus
 from pulsefeed.trigger import CompositePolicy, FixedThresholdPolicy
 
 from .baselines import ARMS, build_arm_pipeline, feed_events
@@ -761,6 +763,78 @@ async def scenario_broker_interruption(duration: float = 600.0) -> ScenarioResul
 # runner
 # --------------------------------------------------------------------------
 
+async def scenario_bus_crash_recovery(duration: float = 300.0) -> ScenarioResult:
+    """Kill the consumer mid-stream; prove nothing is lost.
+
+    The ``broker`` scenario above models an outage with a local buffer. This one
+    exercises the real bus contract instead: a consumer takes delivery of a
+    batch, dies before acknowledging it, and a replacement consumer reclaims the
+    abandoned work. That is the case that distinguishes durable ingestion from a
+    queue that merely looks durable.
+    """
+    result = ScenarioResult("bus crash recovery (unacked work is reclaimed)", passed=True)
+    events = generate_trace(
+        TraceConfig(duration_seconds=duration, incident_count=2, seed=16)
+    )
+
+    clock = VirtualClock(origin=events[0].timestamp)
+    bus = InMemoryEventBus()
+    pipeline = build_arm_pipeline(PULSEFEED_ARM, clock, tenant_id="acme")
+
+    for event in events:
+        await bus.publish(event)
+
+    # Consumer A takes a batch and dies without acknowledging any of it.
+    doomed = await bus.consume("pulsefeed", "consumer-a", count=100, block_ms=0)
+    stranded = len(doomed)
+
+    # Consumer B takes over: first the abandoned batch, then the remainder.
+    worker = IngestWorker(
+        bus,
+        pipeline,
+        IngestConfig(consumer="consumer-b", block_ms=0, reclaim_idle_ms=0),
+    )
+    reclaimed = []
+    while True:
+        batch = await bus.reclaim_stale("pulsefeed", "consumer-b", min_idle_ms=0)
+        if not batch:
+            break
+        for delivery in batch:
+            await pipeline.ingest(delivery.event)
+        await bus.ack("pulsefeed", [d.delivery_id for d in batch])
+        reclaimed += batch
+
+    while await worker.drain_once():
+        pass
+    await pipeline.flush()
+
+    result.check("consumer A really did strand work", stranded > 0)
+    result.check("the abandoned batch was fully reclaimed", len(reclaimed) == stranded)
+    result.check(
+        "every published event reached the pipeline",
+        len(pipeline.events) == len(events),
+    )
+    # At-least-once, so a redelivery is legal — but it must be rare and it must
+    # be harmless. Anything approaching 2x means redelivery is systemic.
+    result.check(
+        "redelivery did not turn into systematic double-processing",
+        pipeline.stats.events_ingested < len(events) * 1.1,
+    )
+    result.check(
+        "nothing is left unacknowledged",
+        await bus.pending_count("pulsefeed") == 0,
+    )
+    result.findings = {
+        "published": len(events),
+        "stranded_by_crash": stranded,
+        "reclaimed": len(reclaimed),
+        "ingest_calls": pipeline.stats.events_ingested,
+        "distinct_events_stored": len(pipeline.events),
+        "worker_stats": dict(worker.stats),
+    }
+    return result
+
+
 SCENARIOS: Dict[str, Callable] = {
     "outage": scenario_provider_outage,
     "burst": scenario_burst,
@@ -768,6 +842,7 @@ SCENARIOS: Dict[str, Callable] = {
     "slow": scenario_slow_provider,
     "poison": scenario_poison_events,
     "broker": scenario_broker_interruption,
+    "bus": scenario_bus_crash_recovery,
 }
 
 

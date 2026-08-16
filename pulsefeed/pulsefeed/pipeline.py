@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from .budget import BudgetLedger, TenantPlan
@@ -68,6 +68,7 @@ from .summarize import (
     detect_contradiction,
     summary_from_annotation,
 )
+from .store.base import NullSink, PersistenceSink
 from .trigger import CompositePolicy, TriggerContext, build_default_policy
 
 
@@ -122,6 +123,7 @@ class PulseFeedPipeline:
         scheduler: Optional[BoundedPriorityScheduler] = None,
         policy: Optional[CompositePolicy] = None,
         metrics: Optional[PulseFeedMetrics] = None,
+        sink: Optional["PersistenceSink"] = None,
     ) -> None:
         self.config = config or PipelineConfig()
         self.clock = clock or RealClock()
@@ -146,6 +148,12 @@ class PulseFeedPipeline:
         self.entities = EntityStore()
         self.summaries = SummaryStore()
         self.rollup = Rollup(self.summaries)
+        # Write-through: the in-process structures stay the serving path and the
+        # sink is the durable record behind them. Serving from the sink would
+        # put a database on the read path of a feed that must survive its
+        # dependencies, which is the opposite of the point.
+        self.sink: PersistenceSink = sink or NullSink()
+        self.sink_failures = 0
 
         self.stats = PipelineStats()
         self.events: Dict[str, Event] = {}
@@ -159,6 +167,7 @@ class PulseFeedPipeline:
         self._open_episodes: Dict[tuple, tuple] = {}
         self._path_by_event: Dict[str, PathTaken] = {}
         self._ingest_time: Dict[str, float] = {}
+        self._visible_at: Dict[str, float] = {}
         self.end_to_end_samples: Dict[str, List[float]] = {"cheap": [], "llm": []}
 
         # Why work was turned away, kept in-process so a test or a dashboard can
@@ -271,12 +280,31 @@ class PulseFeedPipeline:
         self.entities.observe(event)
 
         vector = self.scorer.embed(event.content)
+        await self._persist(self.sink.save_event(event, features, vector))
         for cluster in self.coalescer.offer(event, features, vector, now=now):
             await self._handle_cluster(cluster)
+        # Anything that just opened gets a provisional row immediately, so
+        # time-to-feed is bounded by ingest rather than by how long the
+        # coalescer waits to see whether more events are coming.
+        for provisional in self.coalescer.drain_touched(now):
+            self._publish_cheap_item(provisional, now, provisional=True)
 
     async def ingest_many(self, events: Sequence[Event]) -> None:
         for event in events:
             await self.ingest(event)
+
+    async def _persist(self, coro) -> None:
+        """Await a sink write, treating failure as degradation rather than loss.
+
+        The sink is *fail-open*: a database that is down must not stop the feed,
+        because the serving path does not depend on it and a dropped write is
+        recoverable from the bus. Failures are counted so "persistence is
+        broken" is visible instead of silent.
+        """
+        try:
+            await coro
+        except Exception:
+            self.sink_failures += 1
 
     # ------------------------------------------------------------------
     # trigger
@@ -296,7 +324,7 @@ class PulseFeedPipeline:
 
         # Publish the cheap item first, unconditionally. The feed is now correct
         # and complete regardless of what happens to the LLM path.
-        item = self._publish_cheap_item(cluster, now)
+        self._publish_cheap_item(cluster, now)
 
         ctx = self._trigger_context(cluster, now)
         decision = self.policy.decide_event(
@@ -464,6 +492,11 @@ class PulseFeedPipeline:
         annotation.degraded = outcome.fallback_used
         self.annotations[annotation.annotation_id] = annotation
         self.entities.apply_annotation(annotation)
+        await self._persist(self.sink.save_annotation(annotation))
+        for entity_id in annotation.entities:
+            memory = self.entities.get(cluster.tenant_id, entity_id)
+            if memory is not None:
+                await self._persist(self.sink.save_entity(memory))
 
         if item.audit:
             # Audit results never reach the user's timeline. Their only job is
@@ -471,7 +504,13 @@ class PulseFeedPipeline:
             self._record_audit_result(cluster, annotation)
             return
 
-        self._store_summary(cluster, annotation)
+        summary = self._store_summary(cluster, annotation)
+        await self._persist(self.sink.save_summary(summary))
+        prior = self.summaries.get(summary.supersedes) if summary.supersedes else None
+        if prior is not None:
+            # Persist the superseded row too: the correction is only auditable
+            # if the belief it replaced is on disk with its new status.
+            await self._persist(self.sink.save_summary(prior))
         self._upgrade_timeline_item(cluster, annotation, now)
         for event in cluster.events:
             self._path_by_event[event.event_id] = PathTaken.LLM
@@ -515,7 +554,7 @@ class PulseFeedPipeline:
 
     def _store_summary(
         self, cluster: EventCluster, annotation: SemanticAnnotation
-    ) -> None:
+    ) -> Summary:
         summary = summary_from_annotation(annotation, SummaryLevel.CLUSTER)
         if not summary.entity_ids:
             summary.entity_ids = [cluster.entity_id]
@@ -530,6 +569,7 @@ class PulseFeedPipeline:
         item = self._item_by_cluster.get(cluster.cluster_id)
         if item is not None:
             self._item_by_summary[summary.summary_id] = item
+        return summary
 
     # ------------------------------------------------------------------
     # hierarchy: cluster summaries -> episodes
@@ -722,8 +762,9 @@ class PulseFeedPipeline:
             for c in children
             if c.summary_id in self._item_by_summary
         ]
-        best_child = max((i.rank_score for i in child_items), default=0.0)
-        item.rank_score = min(1.0, best_child + 0.05)
+        best_child = max((i.base_rank for i in child_items), default=0.0)
+        item.base_rank = min(1.0, best_child + 0.05)
+        item.rank_score = item.base_rank
         for child_item in child_items:
             child_item.rolled_up_into = item.item_id
             self._rolled_up.add(child_item.item_id)
@@ -741,7 +782,29 @@ class PulseFeedPipeline:
                 return prior
         return None
 
-    def _publish_cheap_item(self, cluster: EventCluster, now: float) -> TimelineItem:
+    def _publish_cheap_item(
+        self, cluster: EventCluster, now: float, provisional: bool = False
+    ) -> TimelineItem:
+        """Write (or refresh) the LLM-free row for a cluster.
+
+        Called twice per cluster in the normal case: once provisionally when it
+        opens, once when it closes with its full membership. The second call
+        updates the same row rather than adding another, so a growing happening
+        occupies one slot in the feed throughout its life.
+        """
+        existing = self._item_by_cluster.get(cluster.cluster_id)
+        if existing is not None:
+            existing.title = describe_cluster(cluster)
+            existing.event_count = cluster.size
+            existing.source_event_ids = cluster.event_ids
+            existing.kind = "cluster" if cluster.size > 1 else "event"
+            if not existing.enriched:
+                existing.severity = self._cheap_severity(cluster.features.risk)
+                existing.base_rank = self._cheap_rank(cluster, now)
+                existing.rank_score = existing.base_rank
+            self._record_visible(cluster, now)
+            return existing
+
         features = cluster.features
         item = TimelineItem(
             item_id=new_id("itm"),
@@ -749,6 +812,7 @@ class PulseFeedPipeline:
             title=describe_cluster(cluster),
             timestamp=cluster.representative.timestamp,
             rank_score=self._cheap_rank(cluster, now),
+            base_rank=self._cheap_rank(cluster, now),
             source_event_ids=cluster.event_ids,
             kind="cluster" if cluster.size > 1 else "event",
             severity=self._cheap_severity(features.risk),
@@ -759,15 +823,27 @@ class PulseFeedPipeline:
         self._timeline.setdefault(cluster.tenant_id, {})[item.item_id] = item
         self._item_by_cluster[cluster.cluster_id] = item
         self.metrics.timeline_items.labels(cluster.tenant_id, item.kind, "false").inc()
-        for event in cluster.events:
-            ingested = self._ingest_time.get(event.event_id)
-            if ingested is not None:
-                self.end_to_end_samples["cheap"].append(max(0.0, now - ingested))
-        self.metrics.end_to_end_latency.labels("cheap").observe(
-            max(0.0, now - cluster.closed_at)
-        )
+        self._record_visible(cluster, now)
         self._trim_timeline(cluster.tenant_id)
         return item
+
+    def _record_visible(self, cluster: EventCluster, now: float) -> None:
+        """Record time-to-feed, once per event, at its first appearance.
+
+        Measured at first appearance rather than at cluster close: an event is
+        visible to the reader from the moment its provisional row exists, and
+        counting the later in-place updates instead would report a latency no
+        user experiences.
+        """
+        for event in cluster.events:
+            if event.event_id in self._visible_at:
+                continue
+            self._visible_at[event.event_id] = now
+            ingested = self._ingest_time.get(event.event_id)
+            if ingested is not None:
+                latency = max(0.0, now - ingested)
+                self.end_to_end_samples["cheap"].append(latency)
+                self.metrics.end_to_end_latency.labels("cheap").observe(latency)
 
     def _upgrade_timeline_item(
         self, cluster: EventCluster, annotation: SemanticAnnotation, now: float
@@ -779,7 +855,8 @@ class PulseFeedPipeline:
         item.severity = annotation.severity
         item.enriched = True
         item.degraded = annotation.degraded
-        item.rank_score = self._enriched_rank(cluster, annotation, now)
+        item.base_rank = self._enriched_rank(cluster, annotation, now)
+        item.rank_score = item.base_rank
         self.metrics.timeline_items.labels(cluster.tenant_id, item.kind, "true").inc()
 
     @staticmethod
@@ -793,15 +870,52 @@ class PulseFeedPipeline:
         return Severity.INFO
 
     def _cheap_rank(self, cluster: EventCluster, now: float) -> float:
+        """Rank a cluster without an LLM.
+
+        Two terms here are not obvious and both come from reading a bad ranking
+        rather than from theory:
+
+        ``user_relevance`` is applied *outside* ``importance`` and weighted
+        heavily. It is already an input to importance, but importance is also
+        driven by novelty, so the fifth "@alice can you review this" scored far
+        below the first despite being exactly as relevant to Alice. Being
+        addressed directly is categorical, not a function of how fresh the
+        phrasing is.
+
+        ``entity_boost`` is the first use of entity memory in ranking rather
+        than in prompting. "deployment #813 completed" is lexically boring and
+        the cheap scorer has no way to know better — but the same sentence about
+        a service that is *currently degraded* is the most interesting line in
+        the feed. State the model already tracks, finally consulted.
+        """
         f = cluster.features
         age_hours = max(0.0, (now - cluster.representative.timestamp) / 3600.0)
         recency = 1.0 / (1.0 + age_hours)
         return (
-            0.45 * f.importance
-            + 0.30 * f.risk
-            + 0.15 * f.user_relevance
-            + 0.10 * recency
+            0.40 * f.importance
+            + 0.26 * f.risk
+            + 0.26 * f.user_relevance
+            + 0.08 * recency
         )
+
+    def _entity_boost(self, tenant_id: str, entity_ids: Sequence[str]) -> float:
+        """How much an entity's *current* state raises an otherwise-dull item.
+
+        Applied at read time rather than baked in at publish time. An event that
+        looked routine when it arrived becomes interesting the moment its
+        service is declared degraded, and that verdict usually lands after the
+        event was already published.
+        """
+        best = 0.0
+        for entity_id in entity_ids:
+            memory = self.entities.get(tenant_id, entity_id)
+            if memory is None:
+                continue
+            if memory.current_state == "degraded":
+                best = max(best, 0.18)
+            elif memory.current_state == "recovering":
+                best = max(best, 0.08)
+        return best
 
     def _enriched_rank(
         self, cluster: EventCluster, annotation: SemanticAnnotation, now: float
@@ -845,6 +959,11 @@ class PulseFeedPipeline:
             if expand_rolled_up or i.rolled_up_into is None
         ]
         if ranked:
+            for item in items:
+                item.rank_score = min(
+                    1.0,
+                    item.base_rank + self._entity_boost(tenant_id, item.entity_ids),
+                )
             items.sort(key=lambda i: (-i.rank_score, -i.timestamp))
         else:
             items.sort(key=lambda i: -i.timestamp)

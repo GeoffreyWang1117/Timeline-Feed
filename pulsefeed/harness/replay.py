@@ -107,13 +107,24 @@ def format_latency_table(results: Sequence[ArmResult]) -> str:
 
 
 def format_recall_curve(results: Sequence[ArmResult]) -> str:
-    """Recall as the timeline page gets bigger."""
+    """Recall as the timeline page gets bigger, and the scroll depth it costs."""
     ks = sorted({k for r in results for k in r.recall_at_k})
-    headers = ["arm"] + [f"R@{k}" for k in ks] + ["R(all)"]
+    targets = sorted({t for r in results for t in r.items_to_recall})
+    headers = (
+        ["arm"]
+        + [f"R@{k}" for k in ks]
+        + ["R(all)"]
+        + [f"items→{t}%" for t in targets]
+    )
+
+    def depth(value: Optional[int]) -> str:
+        return "never" if value is None else f"{value:,}"
+
     rows = [
         [f"{r.key}. {r.name}"]
         + [f"{r.recall_at_k.get(k, 0.0):.1%}" for k in ks]
         + [f"{r.recall_total:.1%}"]
+        + [depth(r.items_to_recall.get(t)) for t in targets]
         for r in results
     ]
     return _render(headers, rows)

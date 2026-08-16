@@ -25,6 +25,12 @@ from .scoring import aggregate_features
 
 @dataclass
 class CoalescerConfig:
+    # Purely grouping parameters. They used to double as latency parameters —
+    # a cluster reached the feed only when it closed, so a wider window meant a
+    # slower feed — which made every value here a compromise between grouping
+    # quality and freshness. Provisional publication on open (see
+    # ``drain_touched``) removed that coupling, so these can be set for grouping
+    # alone.
     window_seconds: float = 90.0        # max span of one cluster
     idle_close_seconds: float = 20.0    # quiet period that closes a cluster
     max_cluster_size: int = 25
@@ -33,6 +39,10 @@ class CoalescerConfig:
     deadline_guard_seconds: float = 5.0 # close early rather than miss freshness
     aggressive_window_multiplier: float = 4.0
     aggressive_similarity_drop: float = 0.18
+    # Concurrent conversations tracked per entity. A busy channel carries
+    # several unrelated threads at once; one open cluster per entity means each
+    # new topic evicts the last and nothing ever groups.
+    max_open_per_entity: int = 6
 
 
 @dataclass
@@ -54,7 +64,7 @@ class _OpenCluster:
         else:
             # Running mean, then renormalise so cosine stays meaningful.
             self.centroid = [
-                (c * n + v) / (n + 1) for c, v in zip(self.centroid, vector)
+                (c * n + v) / (n + 1) for c, v in zip(self.centroid, vector, strict=True)
             ]
             norm = sum(c * c for c in self.centroid) ** 0.5
             if norm > 0:
@@ -72,7 +82,8 @@ class Coalescer:
 
     def __init__(self, config: Optional[CoalescerConfig] = None) -> None:
         self.config = config or CoalescerConfig()
-        self._open: Dict[Tuple[str, str], _OpenCluster] = {}
+        self._open: Dict[Tuple[str, str], List[_OpenCluster]] = {}
+        self._opened: List[_OpenCluster] = []
         self._aggressive = False
         self.stats = {
             "events_in": 0,
@@ -114,52 +125,65 @@ class Coalescer:
         vector: List[float],
         now: Optional[float] = None,
     ) -> List[EventCluster]:
-        """Feed one event in; get back any clusters that closed as a result."""
+        """Feed one event in; get back any clusters that closed as a result.
+
+        A new event is matched against *all* clusters currently open for its
+        entity, not just the most recent one. That distinction turned out to
+        matter a lot: an entity like a busy Slack channel carries many unrelated
+        conversations at once, and a single-open-cluster design closed the
+        current cluster as ``topic_changed`` on almost every event, so nothing
+        ever coalesced and the feed filled with near-duplicate one-line items.
+        Several concurrent clusters per entity let interleaved conversations
+        each accumulate.
+        """
         now = now if now is not None else event.timestamp
         self.stats["events_in"] += 1
         emitted = self._close_expired(now)
 
         key = (event.tenant_id, event.primary_entity)
-        open_cluster = self._open.get(key)
-
-        if open_cluster is None:
-            self._open[key] = self._new_cluster(event, features, vector)
-            emitted.extend(self._close_if_urgent_or_full(key, features, now))
-            return emitted
-
-        similarity = cosine(vector, open_cluster.centroid)
-        span = event.timestamp - open_cluster.opened_at
+        candidates = self._open.setdefault(key, [])
         merge_threshold = self._merge_threshold()
+        window = self._window()
 
-        too_old = span > self._window()
-        too_big = len(open_cluster.events) >= self.config.max_cluster_size
-        clearly_different = similarity < self.config.ambiguous_similarity
+        best: Optional[_OpenCluster] = None
+        best_similarity = -1.0
+        for cluster in candidates:
+            if event.timestamp - cluster.opened_at > window:
+                continue
+            if len(cluster.events) >= self.config.max_cluster_size:
+                continue
+            similarity = cosine(vector, cluster.centroid)
+            if similarity > best_similarity:
+                best, best_similarity = cluster, similarity
 
-        if too_old or too_big or clearly_different:
-            reason = (
-                "window_expired"
-                if too_old
-                else "max_size"
-                if too_big
-                else "topic_changed"
-            )
-            emitted.append(self._close(key, now, reason))
-            self._open[key] = self._new_cluster(event, features, vector)
-            emitted.extend(self._close_if_urgent_or_full(key, features, now))
-            return emitted
+        if best is None or best_similarity < self.config.ambiguous_similarity:
+            # Nothing open is plausibly about the same thing. Open a new cluster,
+            # evicting the stalest if this entity is already at its limit.
+            if len(candidates) >= self.config.max_open_per_entity:
+                oldest = min(candidates, key=lambda c: c.last_event_at)
+                emitted.append(self._close_cluster(key, oldest, now, "max_open"))
+            cluster = self._new_cluster(event, features, vector)
+            self._open.setdefault(key, []).append(cluster)
+            self._touch(cluster)
+        else:
+            if best_similarity < merge_threshold:
+                # The ambiguity band. Merge provisionally, but mark the cluster
+                # so the LLM is asked whether the merge was right.
+                best.needs_boundary_check = True
+                self.stats["boundary_checks"] += 1
+            best.add(event, features, vector)
+            cluster = best
+            self._touch(cluster)
 
-        if similarity < merge_threshold:
-            # The ambiguity band. Merge provisionally, but mark the cluster so
-            # the LLM is asked whether the merge was right.
-            open_cluster.needs_boundary_check = True
-            self.stats["boundary_checks"] += 1
-
-        open_cluster.add(event, features, vector)
-        emitted.extend(self._close_if_urgent_or_full(key, features, now))
+        emitted.extend(self._close_if_urgent_or_full(key, cluster, features, now))
         return emitted
 
     def _close_if_urgent_or_full(
-        self, key: Tuple[str, str], features: EventFeatures, now: float
+        self,
+        key: Tuple[str, str],
+        cluster: _OpenCluster,
+        features: EventFeatures,
+        now: float,
     ) -> List[EventCluster]:
         """Release a cluster that should not wait out its window.
 
@@ -171,13 +195,12 @@ class Coalescer:
         nothing more, so holding it open buys latency and nothing else (which is
         also what makes ``max_cluster_size=1`` a clean no-coalescing baseline).
         """
-        cluster = self._open.get(key)
-        if cluster is None:
+        if cluster not in self._open.get(key, []):
             return []
         if features.priority == Priority.P0:
-            return [self._close(key, now, "p0_member")]
+            return [self._close_cluster(key, cluster, now, "p0_member")]
         if len(cluster.events) >= self.config.max_cluster_size:
-            return [self._close(key, now, "max_size")]
+            return [self._close_cluster(key, cluster, now, "max_size")]
         return []
 
     def tick(self, now: Optional[float] = None) -> List[EventCluster]:
@@ -187,10 +210,40 @@ class Coalescer:
     def flush(self, now: Optional[float] = None) -> List[EventCluster]:
         """Close everything. Used at end of a replay or on shutdown."""
         now = now if now is not None else time.time()
-        return [self._close(key, now, "flush") for key in list(self._open.keys())]
+        out: List[EventCluster] = []
+        for key in list(self._open.keys()):
+            for cluster in list(self._open.get(key, ())):
+                out.append(self._close_cluster(key, cluster, now, "flush"))
+        return out
+
+    def _touch(self, cluster: "_OpenCluster") -> None:
+        if cluster not in self._opened:
+            self._opened.append(cluster)
+
+    def drain_touched(self, now: Optional[float] = None) -> List[EventCluster]:
+        """Provisional snapshots of clusters that opened *or grew* since the
+        last call.
+
+        This is what breaks the tie between grouping quality and freshness. A
+        cluster used to reach the feed only when it closed, so every second of
+        coalescing window was a second of publication delay — widening the
+        window to group better pushed p95 time-to-feed from 18s to 45s, and
+        narrowing it again gave the grouping back.
+
+        Publishing provisionally and refreshing the same row in place decouples
+        the two: the window becomes purely a grouping parameter, and an event is
+        visible as soon as it is ingested. Note this has to cover *growth*, not
+        just opening — an earlier version only published on open, which left
+        every event that joined an existing cluster waiting for the close and
+        barely moved p95.
+        """
+        now = now if now is not None else time.time()
+        snapshots = [self._snapshot(c, now, "provisional") for c in self._opened]
+        self._opened.clear()
+        return snapshots
 
     def open_cluster_count(self) -> int:
-        return len(self._open)
+        return sum(len(clusters) for clusters in self._open.values())
 
     # -- internals ---------------------------------------------------------
 
@@ -211,24 +264,49 @@ class Coalescer:
         out: List[EventCluster] = []
         idle_timeout = self._idle_timeout()
         window = self._window()
-        for key, cluster in list(self._open.items()):
-            idle = now - cluster.last_event_at
-            span = now - cluster.opened_at
-            near_deadline = (
-                cluster.deadline() - now <= self.config.deadline_guard_seconds
-            )
-            if idle >= idle_timeout:
-                out.append(self._close(key, now, "idle"))
-            elif span >= window:
-                out.append(self._close(key, now, "window_expired"))
-            elif near_deadline:
-                out.append(self._close(key, now, "deadline_guard"))
+        for key in list(self._open.keys()):
+            # _close_cluster removes the key once its last cluster goes, so this
+            # must re-read rather than hold a reference across the loop.
+            for cluster in list(self._open.get(key, ())):
+                idle = now - cluster.last_event_at
+                span = now - cluster.opened_at
+                near_deadline = (
+                    cluster.deadline() - now <= self.config.deadline_guard_seconds
+                )
+                if idle >= idle_timeout:
+                    out.append(self._close_cluster(key, cluster, now, "idle"))
+                elif span >= window:
+                    out.append(self._close_cluster(key, cluster, now, "window_expired"))
+                elif near_deadline:
+                    out.append(self._close_cluster(key, cluster, now, "deadline_guard"))
         return out
 
-    def _close(self, key: Tuple[str, str], now: float, reason: str) -> EventCluster:
-        cluster = self._open.pop(key)
+    def _close_cluster(
+        self,
+        key: Tuple[str, str],
+        cluster: "_OpenCluster",
+        now: float,
+        reason: str,
+    ) -> EventCluster:
+        clusters = self._open.get(key, [])
+        if cluster in clusters:
+            clusters.remove(cluster)
+        if key in self._open and not clusters:
+            del self._open[key]
         self.stats["clusters_out"] += 1
         self.stats["events_coalesced"] += max(0, len(cluster.events) - 1)
+        return self._snapshot(cluster, now, reason)
+
+    def _snapshot(
+        self, cluster: "_OpenCluster", now: float, reason: str
+    ) -> EventCluster:
+        """Immutable view of a cluster's members as of now.
+
+        Used both for closing and for provisional publication, so a provisional
+        item and its final version are the same shape and share a cluster_id —
+        which is what lets the feed update the row in place instead of
+        publishing the same happening twice.
+        """
         return EventCluster(
             cluster_id=cluster.cluster_id,
             tenant_id=cluster.tenant_id,
@@ -243,6 +321,7 @@ class Coalescer:
 
     def reset(self) -> None:
         self._open.clear()
+        self._opened.clear()
         self._aggressive = False
         for k in self.stats:
             self.stats[k] = 0

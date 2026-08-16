@@ -81,7 +81,7 @@ class HashingEmbedder(Embedder):
 
         grams = list(tokens)
         if self.use_bigrams:
-            grams.extend(f"{a}_{b}" for a, b in zip(tokens, tokens[1:]))
+            grams.extend(f"{a}_{b}" for a, b in zip(tokens, tokens[1:], strict=False))
 
         # Sublinear term weighting: a word repeated ten times is not ten times
         # as meaningful, and telemetry repeats words a lot.
@@ -106,7 +106,7 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity of two unit-norm vectors, clamped to [-1, 1]."""
     if not a or not b:
         return 0.0
-    total = sum(x * y for x, y in zip(a, b))
+    total = sum(x * y for x, y in zip(a, b, strict=True))
     return max(-1.0, min(1.0, total))
 
 

@@ -54,51 +54,52 @@ Nothing is hardcoded; re-running reproduces them.
 
 ### Cost vs quality
 
-| arm | LLM calls | tokens | cost | recall@20 | recall(all) | enriched cov | storylines |
-|---|---|---|---|---|---|---|---|
-| A. Chronological | 0 | 0 | $0.0000 | 7.9% | 100% | 0% | 0% |
-| B. Rule + embedding | 0 | 0 | $0.0000 | 55.3% | 100% | 0% | 0% |
-| C. LLM-everything | 4,905 | 2,218,794 | $3.3282 | 73.7% | 100% | 65.8% | 100% |
-| **D. PulseFeed** | **72** | **37,915** | **$0.0569** | **76.3%** | 100% | 60.5% | 80% |
+| arm | LLM calls | tokens | cost | recall@20 | prec@20 | enriched cov | storylines | items |
+|---|---|---|---|---|---|---|---|---|
+| A. Chronological | 0 | 0 | $0.0000 | 7.9% | 15% | 0% | 0% | 6,396 |
+| B. Rule + embedding | 0 | 0 | $0.0000 | 52.6% | 100% | 0% | 0% | 1,730 |
+| C. LLM-everything | 4,905 | 2,218,794 | $3.3282 | **94.7%** | 95% | 65.8% | 100% | 4,603 |
+| **D. PulseFeed** | **48** | **28,317** | **$0.0425** | 81.6% | 60% | 60.5% | 80% | 1,712 |
 
-### Recall as the page grows
+### Recall as the page grows, and the scroll depth it costs
 
-| arm | R@10 | R@20 | R@50 |
-|---|---|---|---|
-| A. Chronological | 7.9% | 7.9% | 10.5% |
-| B. Rule + embedding | 26.3% | 55.3% | 79.0% |
-| C. LLM-everything | 44.7% | 73.7% | 94.7% |
-| **D. PulseFeed** | **76.3%** | **76.3%** | 89.5% |
+| arm | R@10 | R@20 | R@50 | items→50% | items→80% | items→95% |
+|---|---|---|---|---|---|---|
+| A. Chronological | 7.9% | 7.9% | 10.5% | 3,159 | 4,903 | 6,150 |
+| B. Rule + embedding | 26.3% | 52.6% | 92.1% | 19 | 47 | 63 |
+| C. LLM-everything | 44.7% | 94.7% | 94.7% | 12 | 20 | 419 |
+| **D. PulseFeed** | **76.3%** | 81.6% | **97.4%** | **2** | **19** | **35** |
 
 ### System behaviour under the same load
 
-| arm | p95 e2e | p99 queue wait | max queue | shed as stale |
-|---|---|---|---|---|
-| A. Chronological | 0.00s | 0.00s | 0 | 0 |
-| B. Rule + embedding | 18.30s | 0.00s | 0 | 0 |
-| C. LLM-everything | 67.30s | 74.31s | 1,748 | 1,500 |
-| **D. PulseFeed** | 18.43s | **0.00s** | **1** | **0** |
+| arm | p50 e2e | p95 e2e | p99 queue wait | max queue | shed as stale |
+|---|---|---|---|---|---|
+| A. Chronological | 0.00s | 0.00s | 0.00s | 0 | 0 |
+| B. Rule + embedding | 0.00s | 0.00s | 0.00s | 0 | 0 |
+| C. LLM-everything | 0.00s | 67.30s | 74.31s | 1,748 | 1,500 |
+| **D. PulseFeed** | **0.00s** | **0.00s** | **0.00s** | **2** | **0** |
 
 **Reading these honestly:**
 
-- **98.5% fewer LLM calls than enriching everything (72 vs 4,905), at slightly
-  better recall@20** (76.3% vs 73.7%) and 1.7% of the cost.
-- **PulseFeed's advantage is sharpest on a small page.** At K=10 it reaches
-  76.3% where LLM-everything reaches 44.7%, because one episode item carries a
-  whole incident while LLM-everything spends ten slots on ten separate lines.
-- **LLM-everything cannot keep up.** Its queue reaches 1,748 items, p99 wait
-  74s, and 1,500 items are shed as stale before they are ever served. Its
-  higher R@50 is real, but it is buying it at 58x the cost with a collapsed
-  tail.
-- **PulseFeed's precision@20 (50%) is lower than LLM-everything's (80%).** With
-  episodes packing many events per slot, fewer slots need to be relevant to
-  reach high recall — the remainder is noise that a better ranker should
-  displace. This is a genuine weakness, not a rounding artifact.
-- **PulseFeed covers 80% of planted storylines against LLM-everything's 100%.**
-  Admission control does miss things. That is the trade being made, and it is
-  measured rather than asserted.
-- **With no LLM at all** (arm B — the exact behaviour when the provider is
-  down) the feed still reaches 55.3% recall@20 and 100% total coverage.
+- **99.0% fewer LLM calls than enriching everything (48 vs 4,905), at 1.3% of
+  the cost.**
+- **PulseFeed dominates on scroll depth.** Two items to reach half the important
+  events (C needs 12, B needs 19); 35 to reach 95% where C needs **419**. One
+  episode row carries a whole incident instead of spending twenty rows on it.
+- **LLM-everything wins recall@20 (94.7% vs 81.6%).** That is a real loss, not a
+  metric artifact: between ranks 8 and 23 PulseFeed's feed contains items that
+  should have been displaced. K=20 is the one slice where spreading events
+  thinly across rows pays, and C buys it at 102x the calls with a queue that
+  collapses.
+- **LLM-everything cannot keep up.** 1,748 items queued, p99 wait 74s, and 1,500
+  shed as stale before ever being served. PulseFeed's queue peaks at 2.
+- **precision@20 60% vs 95%** — same cause as the recall@20 gap; the ranker still
+  has room.
+- **PulseFeed covers 80% of planted storylines against 100%.** Admission control
+  does miss things. That is the trade, measured rather than asserted.
+- **With no LLM at all** (arm B — exactly what happens when the provider is
+  down) the feed still reaches 52.6% recall@20 and 100% total coverage, and it
+  is the *same* 1,730-item feed shape, just without prose.
 
 ### Cost–quality frontier
 
@@ -107,19 +108,23 @@ one fixed trace, holding every other component constant.
 
 | θ | LLM calls | cost | enriched cov | cov/call | recall@20 |
 |---|---|---|---|---|---|
-| 0.05 | 185 | $0.1365 | 63.2% | 0.34% | 100.0% |
-| 0.15 | 84 | $0.0644 | 65.8% | 0.78% | 100.0% |
-| 0.35 | 34 | $0.0291 | 60.5% | 1.78% | 73.7% |
-| 0.55 | 28 | $0.0239 | 50.0% | 1.79% | 73.7% |
+| 0.05 | 133 | $0.1031 | 63.2% | 0.47% | 97.4% |
+| 0.15 | 83 | $0.0658 | 68.4% | 0.82% | 86.8% |
+| 0.25 | 52 | $0.0417 | 60.5% | 1.16% | 81.6% |
+| 0.35 | 34 | $0.0291 | 60.5% | 1.78% | 81.6% |
+| 0.55 | 28 | $0.0238 | 50.0% | 1.79% | 79.0% |
 | 0.75 | 15 | $0.0119 | 28.9% | 1.93% | 65.8% |
 | 0.95 | 15 | $0.0119 | 28.9% | 1.93% | 65.8% |
 
-- The threshold is a **12x spend dial** on one unchanged trace, and marginal
-  returns fall about 10x from the cheap end (1.93% coverage per call) to the
-  expensive one (0.20% for the marginal call between the extremes).
+- The threshold is a **9x spend dial** on one unchanged trace, and marginal
+  returns fall about 6x from the cheap end (1.93% coverage per call) to the
+  expensive one (0.29% for the marginal call between the extremes).
 - **Even at θ=0.95 — admit essentially nothing — 15 calls still happen.** Those
   are the hard safety-rule bypasses. Critical events are never subject to the
   budget dial.
+- **recall@20 does move with θ** (65.8% → 97.4%), but only because episodes are
+  built from LLM-produced cluster summaries and episodes pack many events into
+  one row. The gain is *packing*, not better judgement about what matters.
 - **The curve is noisy and not monotonic.** Coverage peaks at θ=0.15 rather than
   at the cheapest threshold; storyline coverage wanders between 60% and 100%.
   With 38 important events across 5 storylines the sample is far too small for
@@ -130,35 +135,59 @@ one fixed trace, holding every other component constant.
 
 ## What changed my mind while building this
 
-Two results worth recording because they contradict the obvious pitch:
+Results that contradicted the obvious pitch, or my own earlier writeup:
 
 **Before hierarchical episodes were wired in, the LLM made no difference to
 recall at all.** recall@20 was identical at every threshold in the sweep — what
 surfaced was decided entirely by the cheap scorer and the coalescer, and
-enrichment only changed how well it read. Adding episode rollups changed that
-(recall@20 now spans 65.8%→100%), but the mechanism is *packing*, not
-judgement: episodes fit more events into one slot. The LLM's contribution to
-retrieval is entirely second-order.
+enrichment only changed how well it read. Adding episode rollups changed that,
+but the mechanism is *packing*, not judgement: episodes fit more events into one
+slot. The LLM's contribution to retrieval is entirely second-order.
 
 **Load-aware admission works so well that the load-shedding path never runs.**
-At 50x offered load the peak queue depth is 1 — coalescing and threshold
-raising absorb the burst upstream, so the bounded queue's overflow policies sit
-idle. Good behaviour, bad testing: there is now a separate scenario that strips
+At 45.6x measured offered load the peak queue depth is **0** — coalescing and
+threshold raising absorb the burst entirely upstream, so the bounded queue's
+overflow policies sit idle and the load-aware term never even engages. Good
+behaviour, bad testing: there is now a separate scenario that strips
 load-awareness and starves capacity purely to prove the shedding order (P3
 first, P0 never) actually holds.
 
+**One open cluster per entity meant a busy channel never coalesced.** Keying
+clusters on entity is right, but a Slack channel carries several unrelated
+conversations at once, so every event closed the previous cluster as
+`topic_changed` and the feed filled with near-duplicate one-line rows. Matching
+against several concurrent clusters per entity cut PulseFeed's item count from
+4,718 to 1,712 on the same trace.
+
+**Fixing that then broke latency, which exposed a design flaw underneath.**
+Clusters that used to be closed early by topic changes now lived out their full
+window, and since a cluster only reached the feed *when it closed*, p95
+time-to-feed went 18s → 45s. Retuning the window traded the grouping back. The
+actual bug was that one parameter controlled both grouping quality and
+freshness. Publishing a provisional row when a cluster opens and refreshing it
+in place as events join decouples them: p50/p95/p99 time-to-feed are now 0.00s
+*and* the grouping window is as wide as it wants to be.
+
+**The in-memory event bus silently ignored `min_idle_ms`.** It was written to
+mirror the Redis semantics so bugs would surface in tests rather than in
+production — and then it handed a consumer's own in-flight batch back to it on
+the next loop, double-processing every event. The bus-crash failure scenario
+caught it (2,657 events published, 5,146 ingested). Honouring idle time fixed it
+to exactly 2,657.
+
 ### Failure injection
 
-`python -m harness.failure_injection` — **6/6 scenarios pass.**
+`python -m harness.failure_injection` — **7/7 scenarios pass.**
 
 | scenario | what is asserted | result |
 |---|---|---|
-| provider outage | feed keeps producing; breaker opens; enrichment resumes after recovery | pass |
-| traffic burst (50x) | offered load 3.3→151 events/s; invocation rate stays flat; peak queue depth **1**; every important event still surfaces | pass |
-| load shedding | with load-awareness stripped and capacity starved: P2/P3 queues saturate, 323 P3 items shed, **P0 and P1 never dropped** | pass |
-| slow provider (6s/call) | 2,457 admissions refused by the deadline policy; breaker stays *closed* (this is the slow path, not the outage path); feed covers every event | pass |
+| provider outage | 557 items still published *during* the outage; breaker opens; enrichment resumes after recovery; every event accounted for | pass |
+| traffic burst (50x) | offered load 3.3→151.5 events/s (**45.6x**); enrichment rate rises only 0.025→0.235/s; 15,872 events coalesced; **peak queue depth 0** | pass |
+| load shedding | load-awareness stripped, capacity starved: P2 and P3 queues saturate, 89 P3 items shed, **P0 and P1 never dropped** | pass |
+| slow provider (6s/call, 1 worker) | 82 admissions refused by the deadline policy; breaker stays *closed* (this is the slow path, not the outage path); feed covers every event | pass |
 | poison events | secrets never reach the prompt; delimiters defanged; fabricated citations stripped and counted; invented fields dropped | pass |
 | broker interruption | 5,017 events buffered and replayed across a 120s outage, zero lost | pass |
+| bus crash recovery | a consumer dies holding 100 unacked deliveries; a replacement reclaims all 100; 2,657 published → 2,657 ingested, nothing stranded | pass |
 
 ---
 
@@ -182,7 +211,19 @@ Optional extras:
 ```bash
 pip install -e '.[all]'             # FastAPI, httpx, prometheus-client
 uvicorn pulsefeed.api:create_app --factory
+
+# Durable ingestion + persistence, tested against real servers:
+pip install -e '.[store]'           # redis, asyncpg
+docker compose up -d                # redis + postgres with pgvector
+PULSEFEED_TEST_REDIS_URL=redis://localhost:6379/0 \
+PULSEFEED_TEST_PG_DSN=postgresql://pulsefeed:pulsefeed@localhost:5432/pulsefeed \
+  python -m pytest tests/test_store.py -q
 ```
+
+Those integration tests skip when the environment variables are unset. They are
+not mocked — a mocked integration test that asserts a client library was called
+proves nothing about the semantics that matter (ack, reclaim, redelivery,
+vector search).
 
 ### What the demo shows
 
@@ -247,6 +288,13 @@ as the feed ages; `event → cluster → episode → digest` keeps summarisation
 cheap. Corrected conclusions *supersede* rather than overwrite, so "what did
 the system believe at 12:05" stays answerable.
 
+**7 · Durability** — an `EventBus` (Redis Streams) buffers ingestion with
+at-least-once delivery, explicit acks and reclaim of work abandoned by dead
+consumers; a `PersistenceSink` (Postgres, with pgvector when present) is the
+durable record. The bus fails *closed* — buffer and replay, because a lost raw
+event is unrecoverable. The sink fails *open* — keep serving and count the
+failure, because a delayed write is not.
+
 Full rationale, including the decisions that turned out wrong and why, is in
 **[DESIGN.md](DESIGN.md)**.
 
@@ -267,8 +315,11 @@ The experiment is worth exactly what its caveats allow.
    join them — in the demo, "deployment #813 completed" is causally central but
    sits outside the incident episode.
 4. **Precision@20 is worse than LLM-everything's.** The ranker has room.
-5. **Storage is in-process.** Redis Streams and Postgres/pgvector sit behind
-   interfaces but are not implemented; there is no durability across restarts.
+5. **Serving is still in-process.** Redis Streams and Postgres/pgvector are now
+   implemented and tested against real servers, but persistence is
+   *write-through*: the in-memory structures remain the read path, and nothing
+   reloads them on restart. Durable ingestion and a durable record exist;
+   durable *serving* does not.
 6. **Single process.** Partitioning by `tenant_id`/`entity_id` is a design
    intention, not running code.
 
@@ -309,7 +360,9 @@ pulsefeed/
 │   ├── clock.py         real / scaled / virtual / manual clocks
 │   ├── metrics.py       Prometheus (optional)
 │   ├── api.py           FastAPI (optional)
-│   └── llm/             provider ABC, mock, OpenAI-compatible, breaker, prompts
+│   ├── ingest.py        bus-driven ingest worker (consume → ingest → ack)
+│   ├── llm/             provider ABC, mock, OpenAI-compatible, breaker, prompts
+│   └── store/           EventBus + PersistenceSink; memory, Redis, Postgres
 ├── harness/
 │   ├── trace.py             seeded traces with ground-truth labels
 │   ├── baselines.py         the four arms

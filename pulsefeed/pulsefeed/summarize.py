@@ -17,14 +17,12 @@ replacement. What the system believed, and when, stays on the record.
 
 from __future__ import annotations
 
-import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .models import (
     SemanticAnnotation,
-    Severity,
     Summary,
     SummaryLevel,
     SummaryStatus,

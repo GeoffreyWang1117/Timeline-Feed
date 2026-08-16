@@ -1,0 +1,52 @@
+# Backing services for PulseFeed's durability layer.
+#
+#   docker compose up -d
+#   PULSEFEED_TEST_REDIS_URL=redis://localhost:6379/0 \
+#   PULSEFEED_TEST_PG_DSN=postgresql://pulsefeed:pulsefeed@localhost:5432/pulsefeed \
+#     python -m pytest tests/test_store.py -q
+#
+# Neither service is required to run PulseFeed — the core, the tests and every
+# experiment run on the standard library alone. These exist so the Redis and
+# Postgres implementations can be exercised against the real thing rather than
+# against mocks.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    # Streams live in memory; the bus is an ingestion buffer, not the record of
+    # truth, so an eviction policy that never evicts is what we want — a full
+    # Redis should reject writes loudly rather than silently drop a stream.
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    # pgvector/pgvector ships the extension preinstalled. On stock Postgres the
+    # sink falls back to a real[] column and in-Python cosine, which works and
+    # is slower.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: pulsefeed
+      POSTGRES_PASSWORD: pulsefeed
+      POSTGRES_DB: pulsefeed
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulsefeed"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

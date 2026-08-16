@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from pulsefeed.budget import BudgetLedger, TenantPlan
+from pulsefeed.budget import BudgetLedger
 from pulsefeed.clock import VirtualClock
 from pulsefeed.trigger import (
     BudgetAwarePolicy,
