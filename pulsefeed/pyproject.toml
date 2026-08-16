@@ -28,6 +28,9 @@ api = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2.5"]
 llm = ["httpx>=0.26"]
 metrics = ["prometheus-client>=0.19"]
 store = ["asyncpg>=0.29", "redis>=5.0"]
+# Only for the transformer path in learning/encoder.py. The logistic scorer,
+# the training harness and every experiment run without any of this.
+gpu = ["sentence-transformers>=2.5", "torch>=2.2"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.3"]
 all = [
     "fastapi>=0.110",
@@ -41,9 +44,16 @@ all = [
 pulsefeed-replay = "harness.replay:main"
 pulsefeed-frontier = "harness.frontier:main"
 pulsefeed-chaos = "harness.failure_injection:main"
+pulsefeed-train = "harness.train:main"
 
 [tool.setuptools]
-packages = ["pulsefeed", "pulsefeed.llm", "pulsefeed.store", "harness"]
+packages = [
+    "pulsefeed",
+    "pulsefeed.llm",
+    "pulsefeed.store",
+    "pulsefeed.learning",
+    "harness",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

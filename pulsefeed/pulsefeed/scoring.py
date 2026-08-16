@@ -18,7 +18,16 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from .embedding import Embedder, HashingEmbedder, max_similarity
 from .models import Event, EventFeatures, Priority
@@ -123,6 +132,23 @@ TELEMETRY_SOURCES = {"telemetry", "metrics", "rss"}
 _MENTION_RE = re.compile(r"@([a-z0-9_.-]+)", re.IGNORECASE)
 
 
+# The feature vector, named and ordered. This tuple is the contract between
+# training and inference: ``CheapScorer.extract`` produces exactly these keys,
+# a learned model consumes exactly these keys, and any disagreement is a loud
+# KeyError rather than a silently mis-weighted feature.
+FEATURE_NAMES: Tuple[str, ...] = (
+    "source_priority",
+    "risk",
+    "recency",
+    "novelty",
+    "user_relevance",
+    "burst",
+    "duplication",
+    "recovery",
+    "action",
+)
+
+
 @dataclass
 class ScorerWeights:
     """Linear model over cheap signals.
@@ -146,6 +172,74 @@ class ScorerWeights:
     duplication: float = -1.8
     recovery: float = 0.5
     action: float = 0.7
+
+    def coefficients(self) -> Dict[str, float]:
+        return {name: getattr(self, name) for name in FEATURE_NAMES}
+
+    @classmethod
+    def from_coefficients(
+        cls, bias: float, coefficients: Mapping[str, float]
+    ) -> "ScorerWeights":
+        """Build from a fitted model's output.
+
+        Missing coefficients are an error rather than a zero: a training run
+        that silently dropped a feature should not quietly ship as a model that
+        ignores it.
+        """
+        missing = [n for n in FEATURE_NAMES if n not in coefficients]
+        if missing:
+            raise ValueError(f"missing coefficients for: {missing}")
+        return cls(bias=bias, **{n: float(coefficients[n]) for n in FEATURE_NAMES})
+
+
+@dataclass
+class Extracted:
+    """One event's features, as seen by both training and inference."""
+
+    values: Dict[str, float]      # exactly FEATURE_NAMES
+    extras: Dict[str, float]      # diagnostics, not model inputs
+    embedding: List[float]        # the text vector, for embedding-aware models
+
+    def vector(self) -> List[float]:
+        return [self.values[name] for name in FEATURE_NAMES]
+
+
+class ScoreModel(Protocol):
+    """Anything that turns an event's cheap features into P(important).
+
+    ``embedding`` is passed to every model but ignored by the linear one. It is
+    in the signature so that a learned text model — a MiniLM head running on a
+    GPU, say — is a drop-in replacement rather than a change to the call site.
+    """
+
+    def predict_proba(
+        self,
+        features: Mapping[str, float],
+        embedding: Optional[Sequence[float]] = None,
+    ) -> float:
+        ...
+
+
+class LinearScoreModel:
+    """Logistic model over ``FEATURE_NAMES``. The default and the fallback.
+
+    Whether its coefficients were hand-set or fitted, inference is identical —
+    which is the point of keeping the hand-tuned version in this exact shape.
+    """
+
+    def __init__(self, weights: Optional[ScorerWeights] = None) -> None:
+        self.weights = weights or ScorerWeights()
+
+    def predict_proba(
+        self,
+        features: Mapping[str, float],
+        embedding: Optional[Sequence[float]] = None,
+    ) -> float:
+        w = self.weights
+        logit = w.bias + sum(
+            getattr(w, name) * features[name] for name in FEATURE_NAMES
+        )
+        return sigmoid(logit)
 
 
 @dataclass
@@ -177,8 +271,14 @@ class CheapScorer:
         self,
         config: Optional[ScorerConfig] = None,
         embedder: Optional[Embedder] = None,
+        model: Optional[ScoreModel] = None,
     ) -> None:
         self.config = config or ScorerConfig()
+        # Hand-set weights unless a fitted model is supplied. Both implement the
+        # same one-method interface, so nothing downstream can tell which is in
+        # use — including the trigger, which keeps treating the output as a
+        # probability because both are calibrated to be one.
+        self.model: ScoreModel = model or LinearScoreModel(self.config.weights)
         self.embedder = embedder or HashingEmbedder()
         self._recent_vectors: Dict[str, Deque[List[float]]] = {}
         self._entity_events: Dict[Tuple[str, str], Deque[float]] = {}
@@ -312,9 +412,22 @@ class CheapScorer:
 
     # -- main entry point --------------------------------------------------
 
-    def score(self, event: Event, now: Optional[float] = None) -> EventFeatures:
+    def extract(self, event: Event, now: Optional[float] = None) -> Extracted:
+        """Compute the named feature vector, plus diagnostics.
+
+        Returns ``(features, extras)`` where ``features`` has exactly the keys
+        in ``FEATURE_NAMES`` and ``extras`` carries things needed downstream but
+        not fed to the model (token count, whether risk terms fired at all).
+
+        **This method has a side effect and the order of calls matters.**
+        ``novelty`` and ``burst`` are computed against rolling per-tenant state
+        that this call also updates, so features are a function of the stream so
+        far, not of the event alone. Training data must therefore be collected
+        by replaying events in order through a fresh scorer — computing features
+        for a shuffled batch would produce novelty scores that could never occur
+        at inference time.
+        """
         now = now if now is not None else time.time()
-        w = self.config.weights
 
         from .embedding import tokenize  # local import keeps module import cheap
 
@@ -326,58 +439,63 @@ class CheapScorer:
             source_priority *= 0.3
 
         risk, has_risk_terms = self._risk_score(tokens)
-        recency = self._recency(event, now)
         vector = self.embedder.embed(event.content)
         novelty, duplication = self._novelty(event.tenant_id, vector)
-        burst = self._burst(event, now)
-        user_relevance = self._user_relevance(event, tokens)
-        is_recovery = bool(token_set & RECOVERY_TERMS)
-        is_action = bool(token_set & ACTION_TERMS)
 
-        logit = (
-            w.bias
-            + w.source_priority * source_priority
-            + w.risk * risk
-            + w.recency * recency
-            + w.novelty * novelty
-            + w.user_relevance * user_relevance
-            + w.burst * burst
-            + w.duplication * duplication
-            + w.recovery * (1.0 if is_recovery else 0.0)
-            + w.action * (1.0 if is_action else 0.0)
-        )
-        importance = sigmoid(logit)
+        features = {
+            "source_priority": source_priority,
+            "risk": risk,
+            "recency": self._recency(event, now),
+            "novelty": novelty,
+            "user_relevance": self._user_relevance(event, tokens),
+            "burst": self._burst(event, now),
+            "duplication": duplication,
+            "recovery": 1.0 if token_set & RECOVERY_TERMS else 0.0,
+            "action": 1.0 if token_set & ACTION_TERMS else 0.0,
+        }
+        extras = {
+            "token_count": float(len(tokens)),
+            "has_risk_terms": 1.0 if has_risk_terms else 0.0,
+        }
+        return Extracted(values=features, extras=extras, embedding=vector)
+
+    def score(self, event: Event, now: Optional[float] = None) -> EventFeatures:
+        now = now if now is not None else time.time()
+        extracted = self.extract(event, now)
+        features, extras = extracted.values, extracted.extras
+
+        importance = self.model.predict_proba(features, extracted.embedding)
 
         uncertainty = self._uncertainty(
             importance=importance,
-            risk=risk,
-            has_risk_terms=has_risk_terms,
-            duplication=duplication,
-            source_priority=source_priority,
-            token_count=len(tokens),
+            risk=features["risk"],
+            has_risk_terms=bool(extras["has_risk_terms"]),
+            duplication=features["duplication"],
+            source_priority=features["source_priority"],
+            token_count=int(extras["token_count"]),
         )
-        priority = self._priority(event, importance, risk, user_relevance)
+        priority = self._priority(
+            event, importance, features["risk"], features["user_relevance"]
+        )
         est_tokens, est_usd = self._estimate_cost(event)
 
         return EventFeatures(
             event_id=event.event_id,
             importance=importance,
-            novelty=novelty,
+            novelty=features["novelty"],
             uncertainty=uncertainty,
-            risk=risk,
-            user_relevance=user_relevance,
-            burst_score=burst,
-            duplication_score=duplication,
+            risk=features["risk"],
+            user_relevance=features["user_relevance"],
+            burst_score=features["burst"],
+            duplication_score=features["duplication"],
             estimated_llm_tokens=est_tokens,
             estimated_cost_usd=est_usd,
             priority=priority,
-            signals={
-                "source_priority": source_priority,
-                "recency": recency,
-                "is_recovery": 1.0 if is_recovery else 0.0,
-                "is_action": 1.0 if is_action else 0.0,
-                "token_count": float(len(tokens)),
-            },
+            # The full feature vector rides along verbatim. Training data is
+            # collected from live scoring, so what the model sees at fit time is
+            # byte-for-byte what it saw at inference time — no reimplementation
+            # of feature extraction to drift out of sync.
+            signals={**features, **extras},
         ).clamped()
 
     def embed(self, text: str) -> List[float]:

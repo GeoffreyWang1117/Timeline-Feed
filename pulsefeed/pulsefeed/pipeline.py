@@ -45,6 +45,7 @@ from .metrics import CIRCUIT_STATE_VALUES, PulseFeedMetrics
 from .models import (
     Event,
     EventCluster,
+    EventFeatures,
     PathTaken,
     Priority,
     SemanticAnnotation,
@@ -81,6 +82,7 @@ class PipelineConfig:
     initial_service_latency: float = 0.4
     timeline_capacity: int = 2000       # items retained per tenant
     episode_interval: float = 120.0     # simulated seconds between rollup passes
+    feature_memory: int = 20_000        # scored vectors retained for training/debug
     enable_metrics: bool = True
     seed: int = 1337
 
@@ -168,6 +170,7 @@ class PulseFeedPipeline:
         self._path_by_event: Dict[str, PathTaken] = {}
         self._ingest_time: Dict[str, float] = {}
         self._visible_at: Dict[str, float] = {}
+        self.last_features: Dict[str, EventFeatures] = {}
         self.end_to_end_samples: Dict[str, List[float]] = {"cheap": [], "llm": []}
 
         # Why work was turned away, kept in-process so a test or a dashboard can
@@ -277,6 +280,11 @@ class PulseFeedPipeline:
         self.metrics.events_ingested.labels(event.tenant_id, event.source).inc()
 
         features = self.scorer.score(event, now=now)
+        # Retained so training collection reads the *exact* vector the scorer
+        # used rather than recomputing it. Recomputation would be wrong, not
+        # merely wasteful: novelty and burst advance rolling state, so a second
+        # pass produces features that could never occur at inference.
+        self._remember_features(event.event_id, features)
         self.entities.observe(event)
 
         vector = self.scorer.embed(event.content)
@@ -292,6 +300,18 @@ class PulseFeedPipeline:
     async def ingest_many(self, events: Sequence[Event]) -> None:
         for event in events:
             await self.ingest(event)
+
+    def _remember_features(self, event_id: str, features: "EventFeatures") -> None:
+        """Keep the last N scored feature vectors, bounded.
+
+        Bounded because this is a debugging and training-collection aid, not a
+        store: an unbounded dict here would be an unbounded memory leak on the
+        hottest path in the system.
+        """
+        self.last_features[event_id] = features
+        if len(self.last_features) > self.config.feature_memory:
+            for stale in list(self.last_features)[: self.config.feature_memory // 4]:
+                self.last_features.pop(stale, None)
 
     async def _persist(self, coro) -> None:
         """Await a sink write, treating failure as degradation rather than loss.

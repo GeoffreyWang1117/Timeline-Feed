@@ -86,9 +86,31 @@ def build_provider(clock) -> ResilientProvider:
     return ResilientProvider(providers[0], providers[1:], clock=clock)
 
 
+def build_scorer():
+    """Cheap scorer, using a fitted model when one is configured.
+
+    ``PULSEFEED_SCORER_MODEL`` points at the JSON a training run wrote. If it is
+    unset — or the file is unreadable, or was fitted against a different feature
+    set — the hand-tuned weights are used instead. A bad model file degrades the
+    ranking; it must never stop the service from starting.
+    """
+    from .scoring import CheapScorer
+
+    path = os.environ.get("PULSEFEED_SCORER_MODEL", "")
+    if not path:
+        return CheapScorer()
+    try:
+        from .learning import LogisticScoreModel
+
+        return CheapScorer(model=LogisticScoreModel.load(path))
+    except Exception:
+        return CheapScorer()
+
+
 def create_pipeline() -> PulseFeedPipeline:
     clock = RealClock()
     pipeline = PulseFeedPipeline(
+        scorer=build_scorer(),
         provider=build_provider(clock),
         config=PipelineConfig(
             worker_count=int(os.environ.get("PULSEFEED_WORKERS", "4")),
@@ -238,9 +260,14 @@ if FASTAPI_AVAILABLE:
         @app.get("/readyz")
         async def readyz() -> Dict[str, Any]:
             healthy = pipe.provider.primary_healthy
+            model = getattr(pipe.scorer, "model", None)
             return {
                 "status": "ok",
                 "enrichment": "healthy" if healthy else "degraded",
+                # Which scorer is live is the first thing to check when ranking
+                # looks wrong, and a silently-failed model load looks identical
+                # to a deliberate hand-tuned deployment without this.
+                "scorer": type(model).__name__ if model else "unknown",
                 "queue_depth": pipe.scheduler.depth,
                 "breakers": {
                     name: b.state.value

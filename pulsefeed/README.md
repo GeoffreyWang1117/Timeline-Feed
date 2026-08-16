@@ -175,6 +175,52 @@ the next loop, double-processing every event. The bus-crash failure scenario
 caught it (2,657 events published, 5,146 ingested). Honouring idle time fixed it
 to exactly 2,657.
 
+### Learned scorer vs hand-tuned weights
+
+`python -m harness.train` collects features in stream order, splits by time,
+fits with inverse-propensity weights, calibrates on a third split, and compares
+against the hand-set weights **at equal LLM budget**.
+
+| labels | ECE (hand → learned) | recall@1% (hand → learned) |
+|---|---|---|
+| ground truth, 5.2k events / 62 pos | 0.047 → **0.009** | 0.72 → 0.56 |
+| ground truth, 41k events / 254 pos | 0.046 → **0.007** | 0.89 → 0.88 |
+| LLM teacher + audit, 1.6k examples | 0.057 → **0.017** | 0.14 → **0.29** |
+
+- **Calibration improves 5–7x every time**, which the ranking metrics do not
+  show and which matters more than they do — the budget-, load- and
+  deadline-aware thresholds all read the score as a probability.
+- **At 62 positives the hand-tuned prior still wins on ranking.** At 254 the gap
+  closes. That is an argument for the continuous production label stream, not
+  against learning.
+- **On teacher labels — the production shape — the fit doubles recall@1%.**
+- The fit independently agrees with the manual diagnosis above: it wants
+  `user_relevance` at 3.3–3.8 against the hand-set 1.5.
+
+It also found two defects in the feature set that were invisible until there was
+a fit to inspect: `novelty` and `duplication` correlate at exactly **−1.0** (one
+is `1 − other`), and `recency` is **constant** because events are scored at
+ingest, so the weight it has been carrying does nothing.
+
+The training report ends in a `VERDICT` that refuses to ship a ranking win that
+costs calibration. On ground-truth labels it currently says *keep baseline*, and
+that is the correct answer.
+
+Deploying a fitted model is one environment variable:
+
+```bash
+python -m harness.train --duration 1800 --incidents 12 --out models/scorer.json
+PULSEFEED_SCORER_MODEL=models/scorer.json uvicorn pulsefeed.api:create_app --factory
+```
+
+A missing or incompatible model file falls back to the hand-tuned weights rather
+than failing to start; `/readyz` reports which scorer is live.
+
+**Not yet done:** no training on real traffic and no GPU work. The transformer
+path (`learning/encoder.py` — MiniLM embeddings, hybrid embedding+features head)
+is written and tested without torch, but never fitted. See DESIGN.md §8c for the
+staged plan.
+
 ### Failure injection
 
 `python -m harness.failure_injection` — **7/7 scenarios pass.**
@@ -200,10 +246,11 @@ runs on the standard library.
 cd pulsefeed
 
 python demo.py                      # the worked example, annotated
-python -m pytest tests/ -q          # 98 tests
+python -m pytest tests/ -q          # 178 tests
 python -m harness.replay            # the A/B/C/D experiment
 python -m harness.frontier          # cost-quality sweep
 python -m harness.failure_injection # chaos scenarios
+python -m harness.train              # fit the cheap scorer, compare to hand-tuned
 ```
 
 Optional extras:
@@ -288,7 +335,15 @@ as the feed ages; `event → cluster → episode → digest` keeps summarisation
 cheap. Corrected conclusions *supersede* rather than overwrite, so "what did
 the system believe at 12:05" stays answerable.
 
-**7 · Durability** — an `EventBus` (Redis Streams) buffers ingestion with
+**7 · A learned first stage** — the hand-set weights can be replaced by a fitted
+logistic model over the same nine features, distilled from the LLM's own
+annotations. The hard part is not the model, it is the labels: annotations only
+exist for events the trigger admitted, so training on them alone launders the
+current scorer's blind spots into learned coefficients. The audit samples — an
+unbiased draw from the *rejected* region — are reweighted by inverse propensity
+to correct that.
+
+**8 · Durability** — an `EventBus` (Redis Streams) buffers ingestion with
 at-least-once delivery, explicit acks and reclaim of work abandoned by dead
 consumers; a `PersistenceSink` (Postgres, with pgvector when present) is the
 durable record. The bus fails *closed* — buffer and replay, because a lost raw
@@ -362,14 +417,17 @@ pulsefeed/
 │   ├── api.py           FastAPI (optional)
 │   ├── ingest.py        bus-driven ingest worker (consume → ingest → ack)
 │   ├── llm/             provider ABC, mock, OpenAI-compatible, breaker, prompts
+│   ├── learning/        dataset + IPS weighting, logistic fit, calibration,
+│   │                    evaluation, collection, GPU encoder path
 │   └── store/           EventBus + PersistenceSink; memory, Redis, Postgres
 ├── harness/
 │   ├── trace.py             seeded traces with ground-truth labels
 │   ├── baselines.py         the four arms
 │   ├── replay.py            the experiment
 │   ├── frontier.py          cost-quality sweep
+│   ├── train.py             fit + evaluate the cheap scorer
 │   └── failure_injection.py chaos scenarios
-├── tests/                   98 tests
+├── tests/                   178 tests (+14 needing Redis/Postgres)
 ├── demo.py
 └── DESIGN.md
 ```

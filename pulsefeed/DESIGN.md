@@ -352,6 +352,135 @@ classifier rather than more hand-tuned weights.
 
 ---
 
+## 8c. Learning the first stage
+
+§8a ended with "the fix is probably a trained classifier rather than more
+hand-tuned weights." `pulsefeed/learning/` is that, built and measured. It has
+not yet been trained on real traffic or on a GPU — the code is finished, the
+hardware phase is not.
+
+### The label problem comes before the model problem
+
+The obvious plan is free labels: the LLM already annotates every admitted
+cluster, so severity ≥ ERROR is a positive. Continuous, unlimited, no
+annotators.
+
+It is also a feedback loop. **Labels only exist for events the current scorer
+chose to admit.** A model trained on them learns to reproduce the teacher on
+the region the student already selects; whatever the current scorer
+systematically misses stays missed, never enters the training set, and every
+offline metric looks excellent while the blind spot is laundered into learned
+coefficients.
+
+The audit samples fix it. The trigger already enriches ~1% of *rejected*
+clusters and discards the results, purely to measure false negatives — an
+unbiased draw from exactly the invisible region. Weighting them by inverse
+propensity (1/0.01 = 100, capped) makes the union an unbiased estimate of the
+stream. The effect is visible in the collection summary: raw base rate 1.12%,
+weighted 0.34%, because admitted clusters are enriched at 100% while rejections
+are sampled at 30%.
+
+Three label sources, with different biases, all supported:
+`GROUND_TRUTH` (synthetic only), `LLM_TEACHER` (biased, free, continuous),
+`AUDIT` (unbiased, rare, expensive).
+
+### Methodology, and the two ways it went wrong first
+
+- **Split by time, not at random.** Near-duplicate events arrive seconds apart —
+  that is the coalescer's whole premise — so a random split puts one copy in
+  train and its twin in validation and reports memorisation.
+- **Three splits, not two.** Calibration needs held-out data, and evaluating on
+  the split the calibrator saw flatters exactly the metric the thresholds depend
+  on.
+- **Do not z-score these features.** This one cost a debugging session. All nine
+  are bounded to [0,1] already; `risk` is zero for most events so its training
+  std is ~0.06, and dividing by that gives it an effective range of ~17. The
+  logit saturated, hundreds of events tied at p = 1.0, and the top of the
+  ranking — the only part the trigger reads — became arbitrary. recall@1% fell
+  from 0.48 to 0.11. Standardisation is retained, off by default, documented.
+- **Statistics must not mutate the data.** The first version standardised
+  examples in place *and* had the model standardise at inference, double-applying
+  the transform. A unit test comparing two paths that should agree caught it.
+
+### Two defects in the feature set, found by the diagnostics
+
+The training report flags collinear and constant features, and immediately
+found both:
+
+- `novelty` and `duplication` correlate at **exactly −1.0** — one is defined as
+  `1 - other`. A fit splits one effect across two coefficients, so neither is
+  individually interpretable, which matters when humans read them next to the
+  hand-set values.
+- `recency` is **constant**. Events are scored at ingest, so their age is always
+  ~0 and the decay term is always 1.0. The hand-tuned weights give it 0.5, which
+  has never done anything.
+
+Neither was visible before there was a fit to inspect.
+
+### Results, including where the fit loses
+
+| labels | ECE (hand → learned) | recall@1% (hand → learned) |
+|---|---|---|
+| ground truth, 5.2k events / 62 pos | 0.047 → 0.009 | 0.72 → 0.56 |
+| ground truth, 41k events / 254 pos | 0.046 → 0.007 | 0.89 → 0.88 |
+| LLM teacher + audit, 1.6k examples | 0.057 → 0.017 | 0.14 → **0.29** |
+
+Reading these honestly:
+
+- **Calibration improves 5-7x, consistently.** Ranking metrics do not show this,
+  and it matters more than they do: the budget-, load- and deadline-aware
+  thresholds all consume the score as a probability, so a well-ranked but
+  overconfident model quietly breaks all three.
+- **At small data, hand-tuned priors beat the fit on ranking.** Sixty-two
+  positives cannot outvote a well-chosen prior. At 254 positives the gap
+  closes to nothing. This is an argument for the continuous production label
+  stream, not against learning.
+- **On teacher labels — the production shape — the fit wins**, doubling
+  recall@1%.
+- **The learned coefficients independently agree with the manual diagnosis.**
+  §8a concluded by hand that `user_relevance` was underweighted; the fit puts it
+  at 3.3–3.8 against the hand-set 1.5. It also agrees closely on `risk`
+  (3.8 vs 2.6) and wants far more `novelty − duplication` separation.
+
+### The teacher's objective is not the user's
+
+Under `LLM_TEACHER` labels the `user_relevance` coefficient collapses to ~0 —
+because the teacher labels by *severity*, and a direct "@alice can you review
+this?" is severity `info`. It is important to Alice and unimportant to a
+severity classifier.
+
+Distillation inherits whatever the teacher was asked, so "what counts as
+important" has to be decided at the prompt, not at the fit. Either the teacher
+is asked about relevance as well as severity, or user-relevance stays a
+hand-set rule outside the learned model. Currently it is the latter, by default.
+
+### Hardware roadmap, in cost order
+
+Each step must beat the previous on `recall_at_budget` and must not regress
+calibration — otherwise the hardware is buying something the thresholds cannot
+use.
+
+1. **Now, CPU.** Logistic regression over nine features. Implemented, evaluated
+   above. Microseconds per event, no model server.
+2. **Next, GPU batch.** `TransformerEmbedder` (MiniLM) replacing the hashed
+   embedder behind the same interface. The hashed embedder is adequate for
+   near-duplicate detection and poor at semantics — "connection pool exhausted"
+   and "too many open DB handles" are one event sharing almost no tokens — so
+   this should improve coalescing *and* novelty at once. Embedding is batchable
+   and cacheable, so throughput is set by batch size, not per-event latency.
+3. **Then, GPU.** `HybridScoreModel`: a linear head over
+   [sentence embedding ‖ cheap features], distilled from teacher labels. Linear
+   over a frozen encoder on purpose — it fits in seconds from cached embeddings
+   and establishes whether the embedding carries signal *before* anyone spends
+   GPU hours proving it does. The cheap features stay: source priority, burst and
+   duplication are not recoverable from text.
+4. **Only if 1–3 leave something on the table.** Fine-tune the encoder.
+
+The interfaces for steps 2 and 3 are written and tested (without torch); step 4
+is not started.
+
+---
+
 ## 8b. Durability: bus and sink
 
 Two interfaces, deliberately separate because their failure modes are opposite.
@@ -425,7 +554,20 @@ Stated plainly, because the experiment is only worth what its caveats allow.
    next step.
 
 5. **Ranking trails at K=20.** 81.6% against LLM-everything's 94.7%, with
-   precision@20 of 60% against 95%. Diagnosed in §8a, not fixed.
+   precision@20 of 60% against 95%. Diagnosed in §8a. The learned scorer (§8c)
+   is the intended fix and does not yet deliver it on ground-truth labels; it
+   does improve calibration substantially and wins on teacher labels.
+
+5a. **The learned scorer has never seen real traffic or a GPU.** Everything in
+   §8c was fitted on synthetic traces. The transformer path is written and
+   tested (without torch) and never trained. Treat the coefficient values as
+   evidence that the machinery works, not as a model anyone should deploy.
+
+5b. **`novelty` and `duplication` are perfectly collinear, and `recency` is
+   constant.** Found by the training diagnostics, left in place: removing them
+   changes `FEATURE_NAMES`, which invalidates the hand-set weights and every
+   fitted model at once. Worth doing deliberately, with a migration, rather than
+   as a drive-by.
 
 6. **Persistence is write-through, not read-through.** The bus and sink are
    implemented and tested against real Redis and Postgres+pgvector, but the
@@ -442,7 +584,13 @@ Stated plainly, because the experiment is only worth what its caveats allow.
 
 - If a captured real trace showed the cheap scorer's recall collapsing on events
   whose importance is not lexically marked, the first stage would need a trained
-  classifier, not better keywords.
+  classifier, not better keywords. (§8c builds that classifier; on synthetic
+  data it has not yet earned its place on ranking, only on calibration.)
+- If the sentence encoder turns out not to beat hashed embeddings on
+  ``recall_at_budget``, steps 3 and 4 of the hardware roadmap should be dropped
+  rather than pursued — the cheap features would then be carrying essentially
+  all the signal, and the honest conclusion is that this problem does not need a
+  GPU.
 - If audit sampling showed a materially nonzero miss rate at the default
   threshold, the default is wrong and should move — that is what the sampling is
   for.
